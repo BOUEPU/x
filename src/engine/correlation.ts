@@ -17,6 +17,13 @@ import {
   CandleGeometryFeatures,
   CandleType,
   EnrichedCandle,
+  IntradayDayRecord,
+  IntradayDirectionFilter,
+  IntradayFullMatrixAnchorSummary,
+  IntradaySlotFilterState,
+  IntradaySlotMatchConfig,
+  IntradaySlotMatchItem,
+  IntradaySlotMatchResult,
   MatchedCandleSnapshot,
   PairRecord,
   PrincipalCandidateResult,
@@ -1952,4 +1959,899 @@ export function filterAndRankBestMatches(
       return b.timestamp - a.timestamp;
     });
 }
+
+// ============================================================================
+// Intraday Time-Slot Direction Correlation & Full-Matrix Collector Engine
+// ============================================================================
+
+const MS_PER_DAY = 86_400_000;
+
+export function extractUtcDayKey(ts: number): number {
+  return Math.floor(ts / MS_PER_DAY);
+}
+
+export function extractUtcDayDateStr(dayKey: number): string {
+  return formatUtcDateIso(dayKey * MS_PER_DAY);
+}
+
+export function hasNonZeroSecondsInCandles(candles: EnrichedCandle[]): boolean {
+  for (let i = 0; i < candles.length; i++) {
+    const rem = ((candles[i].timestamp % 60_000) + 60_000) % 60_000;
+    if (rem !== 0) return true;
+  }
+  return false;
+}
+
+export function extractUtcIntradaySlot(
+  ts: number,
+  includeSeconds: boolean
+): { key: string; sortOrder: number } {
+  const msIntoDay = ((ts % MS_PER_DAY) + MS_PER_DAY) % MS_PER_DAY;
+  const secOfDay = Math.floor(msIntoDay / 1000);
+  const hh = Math.floor(secOfDay / 3600);
+  const mm = Math.floor((secOfDay % 3600) / 60);
+  const ss = secOfDay % 60;
+  const key = includeSeconds
+    ? `${pad2(hh)}:${pad2(mm)}:${pad2(ss)}`
+    : `${pad2(hh)}:${pad2(mm)}`;
+  return { key, sortOrder: secOfDay };
+}
+
+export interface IntradaySlotMenuOption {
+  key: string;
+  sortOrder: number;
+  totalCount: number;
+  nonDojiCount: number;
+}
+
+export function getIntradayTimeSlotOptions(
+  candles: EnrichedCandle[]
+): IntradaySlotMenuOption[] {
+  if (candles.length === 0) return [];
+  const includeSec = hasNonZeroSecondsInCandles(candles);
+  const map = new Map<string, IntradaySlotMenuOption>();
+
+  for (let i = 0; i < candles.length; i++) {
+    const c = candles[i];
+    const slot = extractUtcIntradaySlot(c.timestamp, includeSec);
+    let entry = map.get(slot.key);
+    if (!entry) {
+      entry = {
+        key: slot.key,
+        sortOrder: slot.sortOrder,
+        totalCount: 0,
+        nonDojiCount: 0,
+      };
+      map.set(slot.key, entry);
+    }
+    entry.totalCount++;
+    if (c.candleType !== 'DOJI') {
+      entry.nonDojiCount++;
+    }
+  }
+
+  return Array.from(map.values()).sort((a, b) => a.sortOrder - b.sortOrder);
+}
+
+function isIntradayDirectionMatch(
+  anchorType: CandleType,
+  targetType: CandleType,
+  filter: IntradayDirectionFilter
+): boolean {
+  if (anchorType === 'DOJI' || targetType === 'DOJI') return false;
+  if (anchorType !== targetType) return false;
+  if (filter === 'bullish_only') return anchorType === 'BULLISH';
+  if (filter === 'bearish_only') return anchorType === 'BEARISH';
+  return true;
+}
+
+/**
+ * Computes exact chronological UTC calendar-day records (`YYYY-MM-DD`) comparing
+ * a single `(anchorTf, anchorSlotKey)` against `(targetTf, targetSlotKey)`.
+ */
+export function getIntradayPairDayRecords(
+  candlesByTf: Partial<Record<TimeframeId, EnrichedCandle[]>>,
+  anchorTf: TimeframeId,
+  anchorSlotKey: string,
+  targetTf: TimeframeId,
+  targetSlotKey: string,
+  directionFilter: IntradayDirectionFilter,
+  startDateUtc = '',
+  endDateUtc = ''
+): IntradayDayRecord[] {
+  const anchorCandles = candlesByTf[anchorTf] ?? [];
+  const targetCandles = candlesByTf[targetTf] ?? [];
+  if (anchorCandles.length === 0 || targetCandles.length === 0) return [];
+
+  const filterStartMs = startDateUtc ? parseIsoDateStartUtcMs(startDateUtc) : null;
+  const filterEndMs = endDateUtc ? parseIsoDateEndUtcMs(endDateUtc) : null;
+  const anchorSec = hasNonZeroSecondsInCandles(anchorCandles);
+  const targetSec = hasNonZeroSecondsInCandles(targetCandles);
+
+  const anchorByDay = new Map<number, EnrichedCandle>();
+  for (let i = 0; i < anchorCandles.length; i++) {
+    const c = anchorCandles[i];
+    if (filterStartMs !== null && c.timestamp < filterStartMs) continue;
+    if (filterEndMs !== null && c.timestamp > filterEndMs) continue;
+    if (c.candleType === 'DOJI') continue;
+    const slot = extractUtcIntradaySlot(c.timestamp, anchorSec);
+    if (slot.key !== anchorSlotKey) continue;
+    anchorByDay.set(extractUtcDayKey(c.timestamp), c);
+  }
+
+  const records: IntradayDayRecord[] = [];
+  for (let i = 0; i < targetCandles.length; i++) {
+    const tc = targetCandles[i];
+    if (filterStartMs !== null && tc.timestamp < filterStartMs) continue;
+    if (filterEndMs !== null && tc.timestamp > filterEndMs) continue;
+    const slot = extractUtcIntradaySlot(tc.timestamp, targetSec);
+    if (slot.key !== targetSlotKey) continue;
+
+    const dayKey = extractUtcDayKey(tc.timestamp);
+    const ac = anchorByDay.get(dayKey);
+    if (!ac) continue;
+
+    const matched = isIntradayDirectionMatch(ac.candleType, tc.candleType, directionFilter);
+    records.push({
+      dateStr: extractUtcDayDateStr(dayKey),
+      anchorCandle: ac,
+      targetCandle: tc,
+      isMatch: matched,
+      matchDirection: matched ? (ac.candleType as 'BULLISH' | 'BEARISH') : null,
+    });
+  }
+
+  return records;
+}
+
+function compareIntradaySlotMatchItems(
+  a: IntradaySlotMatchItem,
+  b: IntradaySlotMatchItem
+): number {
+  if (b.matchRatePct !== a.matchRatePct) return b.matchRatePct - a.matchRatePct;
+  if (b.matchedDays !== a.matchedDays) return b.matchedDays - a.matchedDays;
+  if (b.totalCoOccurringDays !== a.totalCoOccurringDays) {
+    return b.totalCoOccurringDays - a.totalCoOccurringDays;
+  }
+  const tfCmp =
+    TIMEFRAME_MAP[a.targetTimeframe].rankOrder - TIMEFRAME_MAP[b.targetTimeframe].rankOrder;
+  if (tfCmp !== 0) return tfCmp;
+  return a.targetSlotSortOrder - b.targetSlotSortOrder;
+}
+
+function popcnt32(x: number): number {
+  x -= (x >>> 1) & 0x55555555;
+  x = (x & 0x33333333) + ((x >>> 2) & 0x33333333);
+  return (((x + (x >>> 4)) & 0x0f0f0f0f) * 0x01010101) >>> 24;
+}
+
+/**
+ * Mode 1A: Single-Anchor Intraday Time-Slot Direction Correlation (e.g. Anchor = `00:01`).
+ */
+export function runSingleAnchorIntradaySlotMatchFromCandles(
+  candlesByTf: Partial<Record<TimeframeId, EnrichedCandle[]>>,
+  config: IntradaySlotMatchConfig,
+  onProgress?: (progress: BestMatchProgress) => void,
+  usedWorker = false
+): IntradaySlotMatchResult {
+  const t0 = typeof performance !== 'undefined' ? performance.now() : Date.now();
+  const computedAtUtc = formatUtcTimestamp(Date.now());
+
+  const anchorCandles = candlesByTf[config.anchorTimeframe] ?? [];
+  const targetTfs = Array.from(new Set(config.targetTimeframes))
+    .filter((tf) => Boolean(candlesByTf[tf] && candlesByTf[tf]!.length > 0))
+    .sort((a, b) => TIMEFRAME_MAP[a].rankOrder - TIMEFRAME_MAP[b].rankOrder);
+
+  const makeEmpty = (warningMessage: string): IntradaySlotMatchResult => ({
+    config,
+    scopeMode: 'single_anchor',
+    anchorTimeframe: config.anchorTimeframe,
+    anchorSlotKey: config.anchorSlotKey,
+    targetTimeframes: targetTfs,
+    totalValidDaysEvaluated: 0,
+    totalAnchorSlotsEvaluated: anchorCandles.length > 0 ? 1 : 0,
+    totalPairwiseEvaluations: 0,
+    effectiveStartUtc: null,
+    effectiveEndUtc: null,
+    matches: [],
+    matrixSummaries: [],
+    warningMessage,
+    computedAtUtc,
+    computeDurationMs: Math.max(
+      0,
+      Math.round(((typeof performance !== 'undefined' ? performance.now() : Date.now()) - t0) * 100) / 100
+    ),
+    usedWorker,
+  });
+
+  if (anchorCandles.length === 0) {
+    return makeEmpty(`Anchor timeframe ${config.anchorTimeframe} has no uploaded candles.`);
+  }
+  if (targetTfs.length === 0) {
+    return makeEmpty('Select at least one uploaded target timeframe.');
+  }
+
+  const filterStartMs = config.startDateUtc ? parseIsoDateStartUtcMs(config.startDateUtc) : null;
+  const filterEndMs = config.endDateUtc ? parseIsoDateEndUtcMs(config.endDateUtc) : null;
+  if (filterStartMs !== null && filterEndMs !== null && filterStartMs > filterEndMs) {
+    return makeEmpty('Start UTC date cannot be after End UTC date.');
+  }
+
+  onProgress?.({ percent: 10, scanned: 0, total: anchorCandles.length, stage: 'indexing' });
+
+  const anchorHasSec = hasNonZeroSecondsInCandles(anchorCandles);
+  const anchorByDay = new Map<number, EnrichedCandle>();
+  let minDayKey = Infinity;
+  let maxDayKey = -Infinity;
+
+  for (let i = 0; i < anchorCandles.length; i++) {
+    const c = anchorCandles[i];
+    if (filterStartMs !== null && c.timestamp < filterStartMs) continue;
+    if (filterEndMs !== null && c.timestamp > filterEndMs) continue;
+    if (c.candleType === 'DOJI') continue;
+
+    const slot = extractUtcIntradaySlot(c.timestamp, anchorHasSec);
+    if (slot.key !== config.anchorSlotKey) continue;
+
+    const dayKey = extractUtcDayKey(c.timestamp);
+    anchorByDay.set(dayKey, c);
+    if (dayKey < minDayKey) minDayKey = dayKey;
+    if (dayKey > maxDayKey) maxDayKey = dayKey;
+  }
+
+  if (anchorByDay.size === 0) {
+    return makeEmpty(
+      `No valid non-Doji occurrences of anchor slot ${config.anchorSlotKey} UTC were found in ${config.anchorTimeframe} for the selected UTC range.`
+    );
+  }
+
+  interface Accumulator {
+    targetTimeframe: TimeframeId;
+    targetSlotKey: string;
+    targetSlotSortOrder: number;
+    totalCoOccurringDays: number;
+    matchedDays: number;
+    bullishMatches: number;
+    bearishMatches: number;
+  }
+
+  const totalTargetRows = targetTfs.reduce((sum, tf) => sum + candlesByTf[tf]!.length, 0);
+  let scannedRows = 0;
+  const accMap = new Map<string, Accumulator>();
+
+  for (let tIdx = 0; tIdx < targetTfs.length; tIdx++) {
+    const targetTf = targetTfs[tIdx];
+    const tCandles = candlesByTf[targetTf]!;
+    const targetHasSec = hasNonZeroSecondsInCandles(tCandles);
+    const step = Math.max(2000, Math.floor(tCandles.length / 15));
+
+    for (let i = 0; i < tCandles.length; i++) {
+      if (i % step === 0) {
+        const pct = 15 + Math.round(((scannedRows + i) / Math.max(1, totalTargetRows)) * 65);
+        onProgress?.({
+          percent: pct,
+          scanned: scannedRows + i,
+          total: totalTargetRows,
+          stage: 'scoring',
+        });
+      }
+
+      const tc = tCandles[i];
+      if (filterStartMs !== null && tc.timestamp < filterStartMs) continue;
+      if (filterEndMs !== null && tc.timestamp > filterEndMs) continue;
+
+      const dayKey = extractUtcDayKey(tc.timestamp);
+      const anchorCandle = anchorByDay.get(dayKey);
+      if (!anchorCandle) continue;
+
+      const slot = extractUtcIntradaySlot(tc.timestamp, targetHasSec);
+      if (
+        config.excludeSelfSlot &&
+        targetTf === config.anchorTimeframe &&
+        slot.key === config.anchorSlotKey
+      ) {
+        continue;
+      }
+
+      const accKey = `${targetTf}|${slot.key}`;
+      let acc = accMap.get(accKey);
+      if (!acc) {
+        acc = {
+          targetTimeframe: targetTf,
+          targetSlotKey: slot.key,
+          targetSlotSortOrder: slot.sortOrder,
+          totalCoOccurringDays: 0,
+          matchedDays: 0,
+          bullishMatches: 0,
+          bearishMatches: 0,
+        };
+        accMap.set(accKey, acc);
+      }
+
+      acc.totalCoOccurringDays++;
+      if (isIntradayDirectionMatch(anchorCandle.candleType, tc.candleType, config.directionFilter)) {
+        acc.matchedDays++;
+        if (anchorCandle.candleType === 'BULLISH') {
+          acc.bullishMatches++;
+        } else {
+          acc.bearishMatches++;
+        }
+      }
+    }
+
+    scannedRows += tCandles.length;
+  }
+
+  onProgress?.({ percent: 85, scanned: totalTargetRows, total: totalTargetRows, stage: 'ranking' });
+
+  const minDays = Math.max(1, Math.floor(config.minCoOccurringDays || 1));
+  const minRate = Math.max(0, Math.min(100, config.minMatchRatePct || 0));
+
+  const qualifying: IntradaySlotMatchItem[] = [];
+  let totalEvaluatedSlots = 0;
+  let filteredOutByMinDays = 0;
+
+  for (const acc of accMap.values()) {
+    totalEvaluatedSlots++;
+    if (acc.totalCoOccurringDays < minDays) {
+      filteredOutByMinDays++;
+      continue;
+    }
+    const matchRatePct =
+      acc.totalCoOccurringDays > 0
+        ? round2((acc.matchedDays / acc.totalCoOccurringDays) * 100)
+        : 0;
+    if (matchRatePct < minRate) continue;
+
+    qualifying.push({
+      id: `idslot_${config.anchorTimeframe}_${config.anchorSlotKey}_${acc.targetTimeframe}_${acc.targetSlotKey}`,
+      rank: 0,
+      anchorTimeframe: config.anchorTimeframe,
+      anchorSlotKey: config.anchorSlotKey,
+      targetTimeframe: acc.targetTimeframe,
+      targetSlotKey: acc.targetSlotKey,
+      targetSlotSortOrder: acc.targetSlotSortOrder,
+      totalCoOccurringDays: acc.totalCoOccurringDays,
+      matchedDays: acc.matchedDays,
+      bullishMatches: acc.bullishMatches,
+      bearishMatches: acc.bearishMatches,
+      matchRatePct,
+      dayRecords: [],
+    });
+  }
+
+  qualifying.sort(compareIntradaySlotMatchItems);
+  const topMatches = qualifying.slice(0, config.maxResults);
+
+  // Build exact chronological dayRecords for returned ranked slots
+  for (let i = 0; i < topMatches.length; i++) {
+    topMatches[i].rank = i + 1;
+    topMatches[i].dayRecords = getIntradayPairDayRecords(
+      candlesByTf,
+      config.anchorTimeframe,
+      config.anchorSlotKey,
+      topMatches[i].targetTimeframe,
+      topMatches[i].targetSlotKey,
+      config.directionFilter,
+      config.startDateUtc,
+      config.endDateUtc
+    );
+  }
+
+  onProgress?.({ percent: 100, scanned: totalTargetRows, total: totalTargetRows, stage: 'ranking' });
+
+  let warningMessage: string | null = null;
+  if (totalEvaluatedSlots === 0) {
+    warningMessage = `No co-occurring same-day candles were found across ${targetTfs.join(', ')} on days containing anchor ${config.anchorSlotKey} UTC.`;
+  } else if (topMatches.length === 0) {
+    if (filteredOutByMinDays === totalEvaluatedSlots) {
+      warningMessage = `Found ${totalEvaluatedSlots} target slots, but none reached the minimum ${minDays} co-occurring days threshold (max available anchor days: ${anchorByDay.size}). Lower "Min Co-Occurring Days" in Step 3.`;
+    } else {
+      warningMessage = `Evaluated ${totalEvaluatedSlots.toLocaleString()} target slots, but none met ≥ ${minRate}% Match Rate and ≥ ${minDays} co-occurring days. Lower thresholds in Step 3.`;
+    }
+  }
+
+  const computeDurationMs = Math.max(
+    0,
+    Math.round(((typeof performance !== 'undefined' ? performance.now() : Date.now()) - t0) * 100) / 100
+  );
+
+  return {
+    config,
+    scopeMode: 'single_anchor',
+    anchorTimeframe: config.anchorTimeframe,
+    anchorSlotKey: config.anchorSlotKey,
+    targetTimeframes: targetTfs,
+    totalValidDaysEvaluated: anchorByDay.size,
+    totalAnchorSlotsEvaluated: 1,
+    totalPairwiseEvaluations: totalEvaluatedSlots,
+    effectiveStartUtc: Number.isFinite(minDayKey) ? extractUtcDayDateStr(minDayKey) : null,
+    effectiveEndUtc: Number.isFinite(maxDayKey) ? extractUtcDayDateStr(maxDayKey) : null,
+    matches: topMatches,
+    matrixSummaries: [],
+    warningMessage,
+    computedAtUtc,
+    computeDurationMs,
+    usedWorker,
+  };
+}
+
+/**
+ * Mode 1B: Full-Matrix ("Collect All Intraday Slots") Engine.
+ * Evaluates EVERY unique intraday anchor time slot against EVERY target `(timeframe, slot)`
+ * using 32-bit packed day bitsets so even 1,440 × 1,440 multi-year 1MIN matrices finish cleanly.
+ */
+export function runFullMatrixIntradaySlotMatchFromCandles(
+  candlesByTf: Partial<Record<TimeframeId, EnrichedCandle[]>>,
+  config: IntradaySlotMatchConfig,
+  onProgress?: (progress: BestMatchProgress) => void,
+  usedWorker = false
+): IntradaySlotMatchResult {
+  const t0 = typeof performance !== 'undefined' ? performance.now() : Date.now();
+  const computedAtUtc = formatUtcTimestamp(Date.now());
+
+  const anchorCandles = candlesByTf[config.anchorTimeframe] ?? [];
+  const targetTfs = Array.from(new Set(config.targetTimeframes))
+    .filter((tf) => Boolean(candlesByTf[tf] && candlesByTf[tf]!.length > 0))
+    .sort((a, b) => TIMEFRAME_MAP[a].rankOrder - TIMEFRAME_MAP[b].rankOrder);
+
+  const makeEmpty = (warningMessage: string): IntradaySlotMatchResult => ({
+    config,
+    scopeMode: 'full_matrix',
+    anchorTimeframe: config.anchorTimeframe,
+    anchorSlotKey: null,
+    targetTimeframes: targetTfs,
+    totalValidDaysEvaluated: 0,
+    totalAnchorSlotsEvaluated: 0,
+    totalPairwiseEvaluations: 0,
+    effectiveStartUtc: null,
+    effectiveEndUtc: null,
+    matches: [],
+    matrixSummaries: [],
+    warningMessage,
+    computedAtUtc,
+    computeDurationMs: Math.max(
+      0,
+      Math.round(((typeof performance !== 'undefined' ? performance.now() : Date.now()) - t0) * 100) / 100
+    ),
+    usedWorker,
+  });
+
+  if (anchorCandles.length === 0) {
+    return makeEmpty(`Anchor timeframe ${config.anchorTimeframe} has no uploaded candles.`);
+  }
+  if (targetTfs.length === 0) {
+    return makeEmpty('Select at least one uploaded target timeframe.');
+  }
+
+  const filterStartMs = config.startDateUtc ? parseIsoDateStartUtcMs(config.startDateUtc) : null;
+  const filterEndMs = config.endDateUtc ? parseIsoDateEndUtcMs(config.endDateUtc) : null;
+  if (filterStartMs !== null && filterEndMs !== null && filterStartMs > filterEndMs) {
+    return makeEmpty('Start UTC date cannot be after End UTC date.');
+  }
+
+  onProgress?.({ percent: 5, scanned: 0, total: anchorCandles.length, stage: 'indexing' });
+
+  const anchorHasSec = hasNonZeroSecondsInCandles(anchorCandles);
+
+  // Step 1: Discover all valid UTC dayKeys and all unique anchor slots
+  const daySet = new Set<number>();
+  const anchorSlotMetaMap = new Map<
+    string,
+    {
+      key: string;
+      sortOrder: number;
+      validDays: number;
+      bullDays: number;
+      bearDays: number;
+    }
+  >();
+
+  let minDayKey = Infinity;
+  let maxDayKey = -Infinity;
+
+  for (let i = 0; i < anchorCandles.length; i++) {
+    const c = anchorCandles[i];
+    if (filterStartMs !== null && c.timestamp < filterStartMs) continue;
+    if (filterEndMs !== null && c.timestamp > filterEndMs) continue;
+
+    const slot = extractUtcIntradaySlot(c.timestamp, anchorHasSec);
+    let sMeta = anchorSlotMetaMap.get(slot.key);
+    if (!sMeta) {
+      sMeta = {
+        key: slot.key,
+        sortOrder: slot.sortOrder,
+        validDays: 0,
+        bullDays: 0,
+        bearDays: 0,
+      };
+      anchorSlotMetaMap.set(slot.key, sMeta);
+    }
+
+    if (c.candleType === 'DOJI') continue;
+
+    const dayKey = extractUtcDayKey(c.timestamp);
+    daySet.add(dayKey);
+    if (dayKey < minDayKey) minDayKey = dayKey;
+    if (dayKey > maxDayKey) maxDayKey = dayKey;
+
+    sMeta.validDays++;
+    if (c.candleType === 'BULLISH') sMeta.bullDays++;
+    else sMeta.bearDays++;
+  }
+
+  if (daySet.size === 0 || anchorSlotMetaMap.size === 0) {
+    return makeEmpty(
+      `No valid non-Doji candles found in ${config.anchorTimeframe} for the selected UTC date range.`
+    );
+  }
+
+  const sortedDays = Array.from(daySet).sort((a, b) => a - b);
+  const dayToIdx = new Map<number, number>();
+  for (let d = 0; d < sortedDays.length; d++) {
+    dayToIdx.set(sortedDays[d], d);
+  }
+
+  const anchorSlots = Array.from(anchorSlotMetaMap.values()).sort(
+    (a, b) => a.sortOrder - b.sortOrder
+  );
+  const anchorSlotToIdx = new Map<string, number>();
+  for (let a = 0; a < anchorSlots.length; a++) {
+    anchorSlotToIdx.set(anchorSlots[a].key, a);
+  }
+
+  // Step 2: Discover all unique `(targetTf, targetSlotKey)` columns
+  interface TargetSlotMeta {
+    tf: TimeframeId;
+    key: string;
+    sortOrder: number;
+  }
+  const targetMetaMap = new Map<string, TargetSlotMeta>();
+  const targetHasSecByTf: Partial<Record<TimeframeId, boolean>> = {};
+
+  for (const tf of targetTfs) {
+    const arr = candlesByTf[tf]!;
+    const hasSec = hasNonZeroSecondsInCandles(arr);
+    targetHasSecByTf[tf] = hasSec;
+    for (let i = 0; i < arr.length; i++) {
+      const c = arr[i];
+      if (filterStartMs !== null && c.timestamp < filterStartMs) continue;
+      if (filterEndMs !== null && c.timestamp > filterEndMs) continue;
+      const dayKey = extractUtcDayKey(c.timestamp);
+      if (!dayToIdx.has(dayKey)) continue;
+
+      const slot = extractUtcIntradaySlot(c.timestamp, hasSec);
+      const id = `${tf}|${slot.key}`;
+      if (!targetMetaMap.has(id)) {
+        targetMetaMap.set(id, { tf, key: slot.key, sortOrder: slot.sortOrder });
+      }
+    }
+  }
+
+  const targetSlots = Array.from(targetMetaMap.values()).sort((a, b) => {
+    const tfCmp = TIMEFRAME_MAP[a.tf].rankOrder - TIMEFRAME_MAP[b.tf].rankOrder;
+    return tfCmp !== 0 ? tfCmp : a.sortOrder - b.sortOrder;
+  });
+  const targetToIdx = new Map<string, number>();
+  for (let t = 0; t < targetSlots.length; t++) {
+    targetToIdx.set(`${targetSlots[t].tf}|${targetSlots[t].key}`, t);
+  }
+
+  const numDays = sortedDays.length;
+  const numWords = Math.ceil(numDays / 32);
+  const numAnchors = anchorSlots.length;
+  const numTargets = targetSlots.length;
+
+  onProgress?.({ percent: 15, scanned: 0, total: numAnchors, stage: 'indexing' });
+
+  // Step 3: Populate compact 32-bit packed day bitsets
+  const aBullBits = new Uint32Array(numAnchors * numWords);
+  const aBearBits = new Uint32Array(numAnchors * numWords);
+  const tPresentBits = new Uint32Array(numTargets * numWords);
+  const tBullBits = new Uint32Array(numTargets * numWords);
+  const tBearBits = new Uint32Array(numTargets * numWords);
+
+  for (let i = 0; i < anchorCandles.length; i++) {
+    const c = anchorCandles[i];
+    if (c.candleType === 'DOJI') continue;
+    if (filterStartMs !== null && c.timestamp < filterStartMs) continue;
+    if (filterEndMs !== null && c.timestamp > filterEndMs) continue;
+
+    const dIdx = dayToIdx.get(extractUtcDayKey(c.timestamp));
+    if (dIdx === undefined) continue;
+
+    const slot = extractUtcIntradaySlot(c.timestamp, anchorHasSec);
+    const aIdx = anchorSlotToIdx.get(slot.key);
+    if (aIdx === undefined) continue;
+
+    const word = dIdx >>> 5;
+    const bit = 1 << (dIdx & 31);
+    const base = aIdx * numWords + word;
+    if (c.candleType === 'BULLISH') {
+      aBullBits[base] |= bit;
+    } else {
+      aBearBits[base] |= bit;
+    }
+  }
+
+  for (const tf of targetTfs) {
+    const arr = candlesByTf[tf]!;
+    const hasSec = Boolean(targetHasSecByTf[tf]);
+    for (let i = 0; i < arr.length; i++) {
+      const c = arr[i];
+      if (filterStartMs !== null && c.timestamp < filterStartMs) continue;
+      if (filterEndMs !== null && c.timestamp > filterEndMs) continue;
+
+      const dIdx = dayToIdx.get(extractUtcDayKey(c.timestamp));
+      if (dIdx === undefined) continue;
+
+      const slot = extractUtcIntradaySlot(c.timestamp, hasSec);
+      const tIdx = targetToIdx.get(`${tf}|${slot.key}`);
+      if (tIdx === undefined) continue;
+
+      const word = dIdx >>> 5;
+      const bit = 1 << (dIdx & 31);
+      const base = tIdx * numWords + word;
+      tPresentBits[base] |= bit;
+      if (c.candleType === 'BULLISH') {
+        tBullBits[base] |= bit;
+      } else if (c.candleType === 'BEARISH') {
+        tBearBits[base] |= bit;
+      }
+    }
+  }
+
+  // Step 4: Fast Bitset Pairwise Matrix Evaluation
+  const minDays = Math.max(1, Math.floor(config.minCoOccurringDays || 1));
+  const minRate = Math.max(0, Math.min(100, config.minMatchRatePct || 0));
+  const topPerAnchorLimit = 10;
+  const matrixSummaries: IntradayFullMatrixAnchorSummary[] = [];
+  let totalPairwiseEvaluations = 0;
+
+  const progressStep = Math.max(1, Math.floor(numAnchors / 30));
+
+  for (let aIdx = 0; aIdx < numAnchors; aIdx++) {
+    if (aIdx % progressStep === 0) {
+      const pct = 20 + Math.round((aIdx / Math.max(1, numAnchors)) * 72);
+      onProgress?.({ percent: pct, scanned: aIdx, total: numAnchors, stage: 'scoring' });
+    }
+
+    const aMeta = anchorSlots[aIdx];
+    const aBase = aIdx * numWords;
+
+    const topTargets: IntradaySlotMatchItem[] = [];
+    let qualifyingRateSum = 0;
+    let qualifyingCount = 0;
+
+    if (aMeta.validDays > 0) {
+      for (let tIdx = 0; tIdx < numTargets; tIdx++) {
+        const tMeta = targetSlots[tIdx];
+        if (
+          config.excludeSelfSlot &&
+          tMeta.tf === config.anchorTimeframe &&
+          tMeta.key === aMeta.key
+        ) {
+          continue;
+        }
+
+        const tBase = tIdx * numWords;
+        let coOccurring = 0;
+        let bullMatches = 0;
+        let bearMatches = 0;
+
+        for (let w = 0; w < numWords; w++) {
+          const ab = aBullBits[aBase + w];
+          const as = aBearBits[aBase + w];
+          const aValid = ab | as;
+          if (aValid === 0) continue;
+
+          const tp = tPresentBits[tBase + w];
+          if (tp === 0) continue;
+
+          coOccurring += popcnt32(aValid & tp);
+          bullMatches += popcnt32(ab & tBullBits[tBase + w]);
+          bearMatches += popcnt32(as & tBearBits[tBase + w]);
+        }
+
+        if (coOccurring === 0) continue;
+        totalPairwiseEvaluations++;
+        if (coOccurring < minDays) continue;
+
+        const matchedDays =
+          config.directionFilter === 'bullish_only'
+            ? bullMatches
+            : config.directionFilter === 'bearish_only'
+              ? bearMatches
+              : bullMatches + bearMatches;
+
+        const matchRatePct = round2((matchedDays / coOccurring) * 100);
+        if (matchRatePct < minRate) continue;
+
+        qualifyingRateSum += matchRatePct;
+        qualifyingCount++;
+
+        const candidateItem: IntradaySlotMatchItem = {
+          id: `mtx_${config.anchorTimeframe}_${aMeta.key}_${tMeta.tf}_${tMeta.key}`,
+          rank: 0,
+          anchorTimeframe: config.anchorTimeframe,
+          anchorSlotKey: aMeta.key,
+          targetTimeframe: tMeta.tf,
+          targetSlotKey: tMeta.key,
+          targetSlotSortOrder: tMeta.sortOrder,
+          totalCoOccurringDays: coOccurring,
+          matchedDays,
+          bullishMatches: config.directionFilter === 'bearish_only' ? 0 : bullMatches,
+          bearishMatches: config.directionFilter === 'bullish_only' ? 0 : bearMatches,
+          matchRatePct,
+          dayRecords: [],
+        };
+
+        // Maintain sorted bounded Top 10 targets for this anchor slot
+        if (topTargets.length < topPerAnchorLimit) {
+          topTargets.push(candidateItem);
+          topTargets.sort(compareIntradaySlotMatchItems);
+        } else {
+          const weakest = topTargets[topTargets.length - 1];
+          if (compareIntradaySlotMatchItems(candidateItem, weakest) < 0) {
+            topTargets[topTargets.length - 1] = candidateItem;
+            topTargets.sort(compareIntradaySlotMatchItems);
+          }
+        }
+      }
+    }
+
+    for (let r = 0; r < topTargets.length; r++) {
+      topTargets[r].rank = r + 1;
+    }
+
+    const top5Slice = topTargets.slice(0, 5);
+    const top5AvgMatchRatePct =
+      top5Slice.length > 0
+        ? round2(top5Slice.reduce((s, item) => s + item.matchRatePct, 0) / top5Slice.length)
+        : 0;
+    const overallAvgMatchRatePct =
+      qualifyingCount > 0 ? round2(qualifyingRateSum / qualifyingCount) : 0;
+
+    matrixSummaries.push({
+      id: `anchor_${config.anchorTimeframe}_${aMeta.key}`,
+      anchorTimeframe: config.anchorTimeframe,
+      anchorSlotKey: aMeta.key,
+      anchorSlotSortOrder: aMeta.sortOrder,
+      totalValidAnchorDays: aMeta.validDays,
+      bullishAnchorDays: aMeta.bullDays,
+      bearishAnchorDays: aMeta.bearDays,
+      bestTarget: topTargets[0] ?? null,
+      topTargets,
+      top5AvgMatchRatePct,
+      overallAvgMatchRatePct,
+    });
+  }
+
+  onProgress?.({ percent: 100, scanned: numAnchors, total: numAnchors, stage: 'ranking' });
+
+  const hasAnyBest = matrixSummaries.some((m) => m.bestTarget !== null);
+  let warningMessage: string | null = null;
+  if (!hasAnyBest) {
+    warningMessage = `Evaluated ${numAnchors} anchor slots across ${numDays} UTC days, but no target pairs met ≥ ${minRate}% Match Rate and ≥ ${minDays} co-occurring days. Lower thresholds in Step 3.`;
+  }
+
+  const computeDurationMs = Math.max(
+    0,
+    Math.round(((typeof performance !== 'undefined' ? performance.now() : Date.now()) - t0) * 100) / 100
+  );
+
+  return {
+    config,
+    scopeMode: 'full_matrix',
+    anchorTimeframe: config.anchorTimeframe,
+    anchorSlotKey: null,
+    targetTimeframes: targetTfs,
+    totalValidDaysEvaluated: numDays,
+    totalAnchorSlotsEvaluated: numAnchors,
+    totalPairwiseEvaluations,
+    effectiveStartUtc: Number.isFinite(minDayKey) ? extractUtcDayDateStr(minDayKey) : null,
+    effectiveEndUtc: Number.isFinite(maxDayKey) ? extractUtcDayDateStr(maxDayKey) : null,
+    matches: [],
+    matrixSummaries,
+    warningMessage,
+    computedAtUtc,
+    computeDurationMs,
+    usedWorker,
+  };
+}
+
+export function runIntradaySlotMatchFromCandles(
+  candlesByTf: Partial<Record<TimeframeId, EnrichedCandle[]>>,
+  config: IntradaySlotMatchConfig,
+  onProgress?: (progress: BestMatchProgress) => void,
+  usedWorker = false
+): IntradaySlotMatchResult {
+  if (config.scopeMode === 'full_matrix') {
+    return runFullMatrixIntradaySlotMatchFromCandles(candlesByTf, config, onProgress, usedWorker);
+  }
+  return runSingleAnchorIntradaySlotMatchFromCandles(candlesByTf, config, onProgress, usedWorker);
+}
+
+export function runIntradaySlotMatchSearch(
+  datasets: Partial<Record<TimeframeId, TimeframeDataset>>,
+  config: IntradaySlotMatchConfig,
+  onProgress?: (progress: BestMatchProgress) => void,
+  usedWorker = false
+): IntradaySlotMatchResult {
+  const candlesByTf: Partial<Record<TimeframeId, EnrichedCandle[]>> = {};
+  for (const tf of TIMEFRAMES) {
+    const ds = datasets[tf.id];
+    if (ds && ds.candles.length > 0) {
+      candlesByTf[tf.id] = ds.candles;
+    }
+  }
+  return runIntradaySlotMatchFromCandles(candlesByTf, config, onProgress, usedWorker);
+}
+
+export function filterAndRankIntradayMatches(
+  matches: IntradaySlotMatchItem[],
+  filters: IntradaySlotFilterState
+): IntradaySlotMatchItem[] {
+  const q = filters.searchQuery.trim().toLowerCase();
+  return matches
+    .filter((m) => {
+      if (m.matchRatePct < filters.minRateOverride) return false;
+      if (
+        filters.targetTimeframeFilter !== 'ALL' &&
+        m.targetTimeframe !== filters.targetTimeframeFilter
+      ) {
+        return false;
+      }
+      if (
+        filters.directionBiasFilter === 'bullish_dominant' &&
+        m.bullishMatches <= m.bearishMatches
+      ) {
+        return false;
+      }
+      if (
+        filters.directionBiasFilter === 'bearish_dominant' &&
+        m.bearishMatches <= m.bullishMatches
+      ) {
+        return false;
+      }
+      if (q) {
+        const hay = `${m.targetSlotKey} ${m.targetTimeframe} ${m.anchorSlotKey} ${m.anchorTimeframe}`.toLowerCase();
+        if (!hay.includes(q)) return false;
+      }
+      return true;
+    })
+    .slice()
+    .sort(compareIntradaySlotMatchItems);
+}
+
+export function filterIntradayMatrixSummaries(
+  summaries: IntradayFullMatrixAnchorSummary[],
+  filters: IntradaySlotFilterState
+): IntradayFullMatrixAnchorSummary[] {
+  const q = filters.searchQuery.trim().toLowerCase();
+  return summaries.filter((row) => {
+    const best = row.bestTarget;
+    if (filters.minRateOverride > 0 && (!best || best.matchRatePct < filters.minRateOverride)) {
+      return false;
+    }
+    if (
+      filters.targetTimeframeFilter !== 'ALL' &&
+      (!best || best.targetTimeframe !== filters.targetTimeframeFilter)
+    ) {
+      return false;
+    }
+    if (filters.directionBiasFilter === 'bullish_dominant') {
+      if (!best || best.bullishMatches <= best.bearishMatches) return false;
+    }
+    if (filters.directionBiasFilter === 'bearish_dominant') {
+      if (!best || best.bearishMatches <= best.bullishMatches) return false;
+    }
+    if (q) {
+      const hay = `${row.anchorSlotKey} ${row.anchorTimeframe} ${best ? `${best.targetTimeframe} ${best.targetSlotKey}` : ''}`.toLowerCase();
+      if (!hay.includes(q)) return false;
+    }
+    return true;
+  });
+}
+
 

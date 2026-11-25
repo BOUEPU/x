@@ -8,6 +8,10 @@ import {
   BestMatchResult,
   CollectedCandleSlot,
   CollectorResult,
+  IntradayFullMatrixAnchorSummary,
+  IntradaySlotFilterState,
+  IntradaySlotMatchItem,
+  IntradaySlotMatchResult,
   PrincipalCandidateResult,
   ResultsFilterState,
   TimeframeDataset,
@@ -718,5 +722,296 @@ export function exportBestMatchesReportPdf(
 
   doc.save(`btc_best_matches_${scopeSlug}.pdf`);
 }
+
+/**
+ * Generates an institutional PDF report for Intraday Time-Slot Direction Correlation
+ * (both Single-Anchor Ranked Table and Full-Matrix All-Slots Leaderboard).
+ */
+export function exportIntradaySlotReportPdf(
+  result: IntradaySlotMatchResult,
+  filteredMatches: IntradaySlotMatchItem[],
+  filteredSummaries: IntradayFullMatrixAnchorSummary[],
+  filters: IntradaySlotFilterState
+): void {
+  const doc = new jsPDF({
+    orientation: 'landscape',
+    unit: 'pt',
+    format: 'a4',
+  });
+
+  const pageWidth = doc.internal.pageSize.getWidth();
+  const marginX = 34;
+
+  // Header Banner
+  doc.setFillColor(11, 15, 23);
+  doc.rect(0, 0, pageWidth, 74, 'F');
+
+  doc.setTextColor(245, 158, 11);
+  doc.setFont('helvetica', 'bold');
+  doc.setFontSize(9);
+  doc.text(
+    result.scopeMode === 'single_anchor'
+      ? 'DAILY INTRADAY TIME-SLOT DIRECTION CORRELATION REPORT'
+      : 'FULL-MATRIX INTRADAY TIME-SLOT COLLECTION REPORT',
+    marginX,
+    24
+  );
+
+  doc.setTextColor(248, 250, 252);
+  doc.setFontSize(17);
+  doc.text('BTC Multi-Timeframe Candle Correlation Analyzer', marginX, 46);
+
+  doc.setTextColor(148, 163, 184);
+  doc.setFont('helvetica', 'normal');
+  doc.setFontSize(9);
+  doc.text(`Generated (UTC): ${result.computedAtUtc}`, marginX, 62);
+  doc.text(
+    result.scopeMode === 'single_anchor'
+      ? `Anchor: ${result.anchorTimeframe} ${result.anchorSlotKey} UTC → Targets: ${result.targetTimeframes.join(', ')}`
+      : `Full Matrix: ${result.anchorTimeframe} (All Slots) → Targets: ${result.targetTimeframes.join(', ')}`,
+    pageWidth - marginX,
+    62,
+    { align: 'right' }
+  );
+
+  let cursorY = 92;
+  doc.setTextColor(15, 23, 42);
+  doc.setFont('helvetica', 'bold');
+  doc.setFontSize(11);
+  doc.text('1. Correlation Parameters & Summary', marginX, cursorY);
+  cursorY += 10;
+
+  const dateRange =
+    result.effectiveStartUtc && result.effectiveEndUtc
+      ? `${result.effectiveStartUtc} → ${result.effectiveEndUtc}`
+      : 'Full Available Overlap';
+
+  const topSingle = filteredMatches[0] ?? null;
+
+  autoTable(doc, {
+    startY: cursorY,
+    margin: { left: marginX, right: marginX },
+    theme: 'grid',
+    styles: {
+      fontSize: 8.5,
+      cellPadding: 5,
+      textColor: [30, 41, 59],
+      lineColor: [203, 213, 225],
+      lineWidth: 0.5,
+    },
+    headStyles: {
+      fillColor: [15, 23, 42],
+      textColor: [248, 250, 252],
+      fontStyle: 'bold',
+    },
+    head: [['Parameter', 'Value', 'Summary Metric', 'Value']],
+    body: [
+      [
+        'Execution Scope',
+        result.scopeMode === 'single_anchor'
+          ? `Single Anchor (${result.anchorTimeframe} ${result.anchorSlotKey} UTC)`
+          : `Full-Matrix (${result.totalAnchorSlotsEvaluated} Anchor Slots)`,
+        'Valid Days Evaluated',
+        result.totalValidDaysEvaluated.toLocaleString(),
+      ],
+      [
+        'Target Timeframes',
+        result.targetTimeframes.join(', '),
+        'Pairwise Slots Evaluated',
+        result.totalPairwiseEvaluations.toLocaleString(),
+      ],
+      [
+        'Direction Filter & Thresholds',
+        `${result.config.directionFilter} · Min ${result.config.minCoOccurringDays} days · ≥${result.config.minMatchRatePct}%`,
+        result.scopeMode === 'single_anchor' ? '#1 Top Matched Slot' : 'Anchor Slots Exported',
+        result.scopeMode === 'single_anchor'
+          ? topSingle
+            ? `${topSingle.targetTimeframe} ${topSingle.targetSlotKey} (${topSingle.matchRatePct.toFixed(2)}%, ${topSingle.matchedDays}/${topSingle.totalCoOccurringDays})`
+            : 'None'
+          : `${filteredSummaries.length} slots`,
+      ],
+      [
+        'Effective UTC Date Range',
+        dateRange,
+        'Dashboard Filter Query',
+        filters.searchQuery || 'None',
+      ],
+    ],
+  });
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  cursorY = ((doc as any).lastAutoTable?.finalY ?? cursorY + 90) + 20;
+
+  if (result.scopeMode === 'single_anchor') {
+    doc.setTextColor(15, 23, 42);
+    doc.setFont('helvetica', 'bold');
+    doc.setFontSize(11);
+    doc.text(
+      `2. Ranked Intraday Time-Slot Matches (${filteredMatches.length} rows)`,
+      marginX,
+      cursorY
+    );
+    cursorY += 10;
+
+    const bodyRows = filteredMatches.map((m, idx) => [
+      `#${idx + 1}`,
+      m.targetTimeframe,
+      `${m.targetSlotKey} UTC`,
+      `${m.matchedDays} / ${m.totalCoOccurringDays}`,
+      `${m.matchRatePct.toFixed(2)}%`,
+      `${m.bullishMatches}`,
+      `${m.bearishMatches}`,
+      m.dayRecords
+        .filter((r) => r.isMatch)
+        .slice(0, 6)
+        .map((r) => r.dateStr)
+        .join(', ') || '—',
+    ]);
+
+    autoTable(doc, {
+      startY: cursorY,
+      margin: { left: marginX, right: marginX },
+      theme: 'striped',
+      styles: {
+        fontSize: 7.8,
+        cellPadding: 4.5,
+        textColor: [15, 23, 42],
+        lineColor: [226, 232, 240],
+        lineWidth: 0.4,
+      },
+      headStyles: {
+        fillColor: [15, 23, 42],
+        textColor: [248, 250, 252],
+        fontStyle: 'bold',
+      },
+      alternateRowStyles: {
+        fillColor: [248, 250, 252],
+      },
+      columnStyles: {
+        0: { halign: 'center', cellWidth: 32 },
+        3: { halign: 'right' },
+        4: { halign: 'right', fontStyle: 'bold' },
+        5: { halign: 'right' },
+        6: { halign: 'right' },
+      },
+      head: [
+        [
+          'Rank',
+          'Target TF',
+          'Target Slot',
+          'Matched / Total Days',
+          'Match Rate %',
+          'Bullish Matches',
+          'Bearish Matches',
+          'Recent Matched Dates (UTC)',
+        ],
+      ],
+      body:
+        bodyRows.length > 0
+          ? bodyRows
+          : [['—', '—', 'No matching slots met current thresholds', '—', '—', '—', '—', '—']],
+      didDrawPage: (data) => {
+        const pageHeight = doc.internal.pageSize.getHeight();
+        doc.setFontSize(8);
+        doc.setTextColor(100, 116, 139);
+        doc.text(
+          'BTC Multi-Timeframe Candle Correlation Analyzer · Intraday Time-Slot Match Report',
+          marginX,
+          pageHeight - 18
+        );
+        doc.text(`Page ${data.pageNumber}`, pageWidth - marginX, pageHeight - 18, {
+          align: 'right',
+        });
+      },
+    });
+
+    const slotSlug = (result.anchorSlotKey || 'slot').replace(/:/g, '');
+    doc.save(`btc_intraday_match_${result.anchorTimeframe.toLowerCase()}_${slotSlug}.pdf`);
+  } else {
+    doc.setTextColor(15, 23, 42);
+    doc.setFont('helvetica', 'bold');
+    doc.setFontSize(11);
+    doc.text(
+      `2. Master Intraday Slot Matrix (${filteredSummaries.length} anchor slots)`,
+      marginX,
+      cursorY
+    );
+    cursorY += 10;
+
+    const bodyRows = filteredSummaries.map((row) => {
+      const b = row.bestTarget;
+      return [
+        `${row.anchorSlotKey} UTC`,
+        row.totalValidAnchorDays.toLocaleString(),
+        b ? `${b.targetTimeframe} ${b.targetSlotKey} UTC` : 'No qualifying target',
+        b ? `${b.matchedDays} / ${b.totalCoOccurringDays}` : '—',
+        b ? `${b.matchRatePct.toFixed(2)}%` : '0.00%',
+        `${row.top5AvgMatchRatePct.toFixed(1)}%`,
+        row.topTargets
+          .slice(0, 3)
+          .map((t) => `${t.targetTimeframe} ${t.targetSlotKey} (${t.matchRatePct.toFixed(0)}%)`)
+          .join(' · ') || '—',
+      ];
+    });
+
+    autoTable(doc, {
+      startY: cursorY,
+      margin: { left: marginX, right: marginX },
+      theme: 'striped',
+      styles: {
+        fontSize: 7.5,
+        cellPadding: 4,
+        textColor: [15, 23, 42],
+        lineColor: [226, 232, 240],
+        lineWidth: 0.4,
+      },
+      headStyles: {
+        fillColor: [15, 23, 42],
+        textColor: [248, 250, 252],
+        fontStyle: 'bold',
+      },
+      alternateRowStyles: {
+        fillColor: [248, 250, 252],
+      },
+      columnStyles: {
+        1: { halign: 'right' },
+        3: { halign: 'right' },
+        4: { halign: 'right', fontStyle: 'bold' },
+        5: { halign: 'right' },
+      },
+      head: [
+        [
+          'Anchor Slot',
+          'Valid Days',
+          '#1 Best Matched Slot',
+          'Matched / Total',
+          'Match Rate %',
+          'Top-5 Avg %',
+          'Top 3 Correlated Slots',
+        ],
+      ],
+      body:
+        bodyRows.length > 0
+          ? bodyRows
+          : [['—', '—', 'No anchor slots matched current filters', '—', '—', '—', '—']],
+      didDrawPage: (data) => {
+        const pageHeight = doc.internal.pageSize.getHeight();
+        doc.setFontSize(8);
+        doc.setTextColor(100, 116, 139);
+        doc.text(
+          'BTC Multi-Timeframe Candle Correlation Analyzer · Full-Matrix Intraday Report',
+          marginX,
+          pageHeight - 18
+        );
+        doc.text(`Page ${data.pageNumber}`, pageWidth - marginX, pageHeight - 18, {
+          align: 'right',
+        });
+      },
+    });
+
+    doc.save(`btc_intraday_full_matrix_${result.anchorTimeframe.toLowerCase()}.pdf`);
+  }
+}
+
 
 

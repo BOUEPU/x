@@ -1,13 +1,21 @@
 import { useEffect, useMemo, useState } from 'react';
 import { ChevronLeft, ChevronRight, X } from 'lucide-react';
+import { getIntradayPairDayRecords } from '../engine/correlation';
 import { formatDecimal } from '../engine/csvParser';
 import {
   BestMatchItem,
   BestMatchSearchScope,
+  EnrichedCandle,
+  IntradayFullMatrixAnchorSummary,
+  IntradaySlotMatchConfig,
+  IntradaySlotMatchItem,
   MatchedCandleSnapshot,
   PrincipalCandidateResult,
+  TimeframeDataset,
+  TimeframeId,
+  TIMEFRAMES,
 } from '../engine/types';
-import { CandlestickComparisonPanel } from './CandleGlyph';
+import { CandlestickComparisonPanel, SingleCandleGlyph } from './CandleGlyph';
 
 interface DrillDownDrawerProps {
   candidate?: PrincipalCandidateResult | null;
@@ -15,10 +23,16 @@ interface DrillDownDrawerProps {
   bestMatch?: BestMatchItem | null;
   referenceSnapshots?: MatchedCandleSnapshot[] | null;
   bestMatchScope?: BestMatchSearchScope;
+  // Intraday Time-Slot inspection props
+  intradayMatch?: IntradaySlotMatchItem | null;
+  intradayMatrixRow?: IntradayFullMatrixAnchorSummary | null;
+  intradayConfig?: IntradaySlotMatchConfig;
+  datasets?: Partial<Record<TimeframeId, TimeframeDataset>>;
   onClose: () => void;
 }
 
 type PairFilter = 'all' | 'match' | 'mismatch' | 'doji';
+type IntradayDayFilter = 'all' | 'match' | 'mismatch';
 
 const PAGE_SIZE = 100;
 
@@ -28,17 +42,25 @@ export function DrillDownDrawer({
   bestMatch = null,
   referenceSnapshots = null,
   bestMatchScope,
+  intradayMatch = null,
+  intradayMatrixRow = null,
+  intradayConfig,
+  datasets,
   onClose,
 }: DrillDownDrawerProps) {
   const [pairFilter, setPairFilter] = useState<PairFilter>('all');
+  const [intradayDayFilter, setIntradayDayFilter] = useState<IntradayDayFilter>('all');
+  const [selectedMatrixTargetId, setSelectedMatrixTargetId] = useState<string | null>(null);
   const [page, setPage] = useState(1);
 
   useEffect(() => {
     setPairFilter('all');
+    setIntradayDayFilter('all');
+    setSelectedMatrixTargetId(intradayMatrixRow?.bestTarget?.id ?? null);
     setPage(1);
-  }, [candidate?.slotKey, bestMatch?.id]);
+  }, [candidate?.slotKey, bestMatch?.id, intradayMatch?.id, intradayMatrixRow?.id, intradayMatrixRow?.bestTarget?.id]);
 
-  const isOpen = Boolean(candidate || bestMatch);
+  const isOpen = Boolean(candidate || bestMatch || intradayMatch || intradayMatrixRow);
 
   useEffect(() => {
     if (!isOpen) return;
@@ -70,7 +92,380 @@ export function DrillDownDrawer({
     return candidate.pairs.filter((p) => !p.isDojiExcluded && !p.isMatch);
   }, [candidate, pairFilter]);
 
+  const activeMatrixTarget = useMemo(() => {
+    if (!intradayMatrixRow) return null;
+    if (selectedMatrixTargetId) {
+      const found = intradayMatrixRow.topTargets.find((t) => t.id === selectedMatrixTargetId);
+      if (found) return found;
+    }
+    return intradayMatrixRow.bestTarget ?? intradayMatrixRow.topTargets[0] ?? null;
+  }, [intradayMatrixRow, selectedMatrixTargetId]);
+
+  const activeIntradayPair = intradayMatch ?? activeMatrixTarget;
+
+  const intradayDayRecords = useMemo(() => {
+    if (!activeIntradayPair) return [];
+    if (activeIntradayPair.dayRecords && activeIntradayPair.dayRecords.length > 0) {
+      return activeIntradayPair.dayRecords;
+    }
+    if (!datasets) return [];
+    const candlesByTf: Partial<Record<TimeframeId, EnrichedCandle[]>> = {};
+    for (const tf of TIMEFRAMES) {
+      const ds = datasets[tf.id];
+      if (ds && ds.candles.length > 0) candlesByTf[tf.id] = ds.candles;
+    }
+    return getIntradayPairDayRecords(
+      candlesByTf,
+      activeIntradayPair.anchorTimeframe,
+      activeIntradayPair.anchorSlotKey,
+      activeIntradayPair.targetTimeframe,
+      activeIntradayPair.targetSlotKey,
+      intradayConfig?.directionFilter ?? 'any_non_doji',
+      intradayConfig?.startDateUtc ?? '',
+      intradayConfig?.endDateUtc ?? ''
+    );
+  }, [activeIntradayPair, datasets, intradayConfig]);
+
+  const intradayCounts = useMemo(() => {
+    let match = 0;
+    let mismatch = 0;
+    for (const r of intradayDayRecords) {
+      if (r.isMatch) match++;
+      else mismatch++;
+    }
+    return { all: intradayDayRecords.length, match, mismatch };
+  }, [intradayDayRecords]);
+
+  const filteredIntradayDays = useMemo(() => {
+    if (intradayDayFilter === 'all') return intradayDayRecords;
+    if (intradayDayFilter === 'match') return intradayDayRecords.filter((r) => r.isMatch);
+    return intradayDayRecords.filter((r) => !r.isMatch);
+  }, [intradayDayRecords, intradayDayFilter]);
+
   if (!isOpen) return null;
+
+  // =========================================================================
+  // INTRADAY TIME-SLOT INSPECTION VIEW (SINGLE-ANCHOR OR FULL-MATRIX TOP-10)
+  // =========================================================================
+  if (intradayMatch || intradayMatrixRow) {
+    const isMatrix = Boolean(intradayMatrixRow);
+    const totalPages = Math.max(1, Math.ceil(filteredIntradayDays.length / PAGE_SIZE));
+    const safePage = Math.min(page, totalPages);
+    const pageDays = filteredIntradayDays.slice((safePage - 1) * PAGE_SIZE, safePage * PAGE_SIZE);
+
+    return (
+      <div
+        className="fixed inset-0 z-50 flex justify-end bg-black/70 backdrop-blur-[2px]"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="drilldown-intraday-title"
+        onClick={(e) => {
+          if (e.target === e.currentTarget) onClose();
+        }}
+      >
+        <div className="flex h-full w-full max-w-5xl flex-col border-l border-[#1E293B] bg-[#0B0F17] shadow-2xl">
+          {/* Header */}
+          <div className="flex items-start justify-between gap-4 border-b border-[#1E293B] bg-[#111824] px-6 py-5">
+            <div className="space-y-1">
+              <p className="text-xs font-medium text-amber-400">
+                {isMatrix
+                  ? `Full-Matrix Anchor Inspection · ${intradayMatrixRow!.anchorTimeframe} (${intradayMatrixRow!.anchorSlotKey} UTC)`
+                  : `Daily Recurrence Breakdown · Rank #${intradayMatch!.rank}`}
+              </p>
+              <h2
+                id="drilldown-intraday-title"
+                className="font-mono text-xl font-bold text-slate-50"
+              >
+                {activeIntradayPair ? (
+                  <>
+                    {activeIntradayPair.anchorTimeframe} {activeIntradayPair.anchorSlotKey} UTC
+                    <span className="mx-2 text-slate-500">→</span>
+                    <span className="text-amber-300">
+                      {activeIntradayPair.targetTimeframe} {activeIntradayPair.targetSlotKey} UTC
+                    </span>
+                  </>
+                ) : (
+                  `${intradayMatrixRow!.anchorTimeframe} ${intradayMatrixRow!.anchorSlotKey} UTC`
+                )}
+              </h2>
+              <p className="font-mono text-xs tabular-nums text-slate-400">
+                {isMatrix
+                  ? `${intradayMatrixRow!.totalValidAnchorDays.toLocaleString()} valid anchor days (${intradayMatrixRow!.bullishAnchorDays} Bull · ${intradayMatrixRow!.bearishAnchorDays} Bear)`
+                  : `${activeIntradayPair!.matchedDays} / ${activeIntradayPair!.totalCoOccurringDays} same-day directional matches`}
+              </p>
+            </div>
+
+            <button
+              type="button"
+              aria-label="Close intraday slot inspection drawer"
+              onClick={onClose}
+              className="inline-flex h-9 w-9 items-center justify-center rounded border border-[#1E293B] bg-[#0B0F17] text-slate-400 transition-colors hover:border-slate-600 hover:text-slate-100"
+            >
+              <X className="h-4 w-4" aria-hidden="true" />
+            </button>
+          </div>
+
+          {/* Active Pair KPI Strip */}
+          {activeIntradayPair && (
+            <div className="grid grid-cols-2 divide-x divide-y divide-[#1E293B] border-b border-[#1E293B] bg-[#0D131E] sm:grid-cols-5 sm:divide-y-0">
+              <div className="px-4 py-3">
+                <p className="text-[11px] text-slate-400">Match Rate</p>
+                <p className="mt-0.5 font-mono text-base font-semibold tabular-nums text-emerald-400">
+                  {activeIntradayPair.matchRatePct.toFixed(2)}%
+                </p>
+              </div>
+              <div className="px-4 py-3">
+                <p className="text-[11px] text-slate-400">Matched / Total</p>
+                <p className="mt-0.5 font-mono text-base font-semibold tabular-nums text-slate-100">
+                  {activeIntradayPair.matchedDays} / {activeIntradayPair.totalCoOccurringDays}
+                </p>
+              </div>
+              <div className="px-4 py-3">
+                <p className="text-[11px] text-slate-400">Bullish Matches</p>
+                <p className="mt-0.5 font-mono text-base font-semibold tabular-nums text-emerald-400">
+                  {activeIntradayPair.bullishMatches.toLocaleString()}
+                </p>
+              </div>
+              <div className="px-4 py-3">
+                <p className="text-[11px] text-slate-400">Bearish Matches</p>
+                <p className="mt-0.5 font-mono text-base font-semibold tabular-nums text-red-400">
+                  {activeIntradayPair.bearishMatches.toLocaleString()}
+                </p>
+              </div>
+              <div className="col-span-2 px-4 py-3 sm:col-span-1">
+                <p className="text-[11px] text-slate-400">Non-Matching Days</p>
+                <p className="mt-0.5 font-mono text-base font-semibold tabular-nums text-slate-300">
+                  {(
+                    activeIntradayPair.totalCoOccurringDays - activeIntradayPair.matchedDays
+                  ).toLocaleString()}
+                </p>
+              </div>
+            </div>
+          )}
+
+          {/* Full-Matrix Top 10 Correlated Slots Selector */}
+          {isMatrix && intradayMatrixRow && (
+            <div className="border-b border-[#1E293B] bg-[#0D131E] px-6 py-4">
+              <div className="mb-2.5 flex items-baseline justify-between gap-2">
+                <h3 className="text-xs font-semibold text-slate-200">
+                  Top {intradayMatrixRow.topTargets.length} Correlated Slots for{' '}
+                  {intradayMatrixRow.anchorTimeframe} {intradayMatrixRow.anchorSlotKey} UTC
+                </h3>
+                <span className="font-mono text-[11px] text-slate-400">
+                  Click any correlated target to inspect its daily UTC calendar history below
+                </span>
+              </div>
+
+              {intradayMatrixRow.topTargets.length === 0 ? (
+                <p className="text-xs text-slate-500">
+                  No correlated target slots met the active minimum days and match rate thresholds.
+                </p>
+              ) : (
+                <div className="grid grid-cols-2 gap-2 sm:grid-cols-5">
+                  {intradayMatrixRow.topTargets.map((item, idx) => {
+                    const isSelected = activeIntradayPair?.id === item.id;
+                    return (
+                      <button
+                        key={item.id}
+                        type="button"
+                        onClick={() => {
+                          setSelectedMatrixTargetId(item.id);
+                          setPage(1);
+                        }}
+                        className={`rounded border px-3 py-2 text-left transition-colors ${
+                          isSelected
+                            ? 'border-amber-500 bg-amber-500/15'
+                            : 'border-[#1E293B] bg-[#111824] hover:border-slate-600'
+                        }`}
+                      >
+                        <div className="flex items-center justify-between gap-1 font-mono text-[11px]">
+                          <span className="text-slate-400">#{idx + 1}</span>
+                          <span className="font-semibold text-emerald-400 tabular-nums">
+                            {item.matchRatePct.toFixed(1)}%
+                          </span>
+                        </div>
+                        <p className="mt-0.5 truncate font-mono text-xs font-semibold text-slate-100">
+                          {item.targetTimeframe} {item.targetSlotKey}
+                        </p>
+                        <p className="font-mono text-[10px] text-slate-400 tabular-nums">
+                          {item.matchedDays}/{item.totalCoOccurringDays}d · {item.bullishMatches}B/
+                          {item.bearishMatches}S
+                        </p>
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Day Filter & Pagination Bar */}
+          {activeIntradayPair && (
+            <div className="flex flex-wrap items-center justify-between gap-3 border-b border-[#1E293B] bg-[#0B0F17] px-6 py-3">
+              <div className="flex flex-wrap items-center gap-1 rounded border border-[#1E293B] bg-[#111824] p-1">
+                {(
+                  [
+                    { id: 'all', label: `All Days (${intradayCounts.all})` },
+                    { id: 'match', label: `Matched (${intradayCounts.match})` },
+                    { id: 'mismatch', label: `Failed / Doji (${intradayCounts.mismatch})` },
+                  ] as { id: IntradayDayFilter; label: string }[]
+                ).map((tab) => (
+                  <button
+                    key={tab.id}
+                    type="button"
+                    onClick={() => {
+                      setIntradayDayFilter(tab.id);
+                      setPage(1);
+                    }}
+                    className={`rounded px-2.5 py-1 text-xs font-medium transition-colors ${
+                      intradayDayFilter === tab.id
+                        ? 'bg-[#1E293B] text-amber-400'
+                        : 'text-slate-400 hover:text-slate-200'
+                    }`}
+                  >
+                    {tab.label}
+                  </button>
+                ))}
+              </div>
+
+              {totalPages > 1 && (
+                <div className="flex items-center gap-2 font-mono text-xs tabular-nums text-slate-400">
+                  <button
+                    type="button"
+                    disabled={safePage <= 1}
+                    onClick={() => setPage((p) => Math.max(1, p - 1))}
+                    aria-label="Previous calendar page"
+                    className="inline-flex h-7 w-7 items-center justify-center rounded border border-[#1E293B] bg-[#111824] text-slate-300 hover:border-slate-600 disabled:opacity-40"
+                  >
+                    <ChevronLeft className="h-3.5 w-3.5" aria-hidden="true" />
+                  </button>
+                  <span>
+                    Page {safePage} / {totalPages}
+                  </span>
+                  <button
+                    type="button"
+                    disabled={safePage >= totalPages}
+                    onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
+                    aria-label="Next calendar page"
+                    className="inline-flex h-7 w-7 items-center justify-center rounded border border-[#1E293B] bg-[#111824] text-slate-300 hover:border-slate-600 disabled:opacity-40"
+                  >
+                    <ChevronRight className="h-3.5 w-3.5" aria-hidden="true" />
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Day-by-Day Table with Side-by-Side Candlestick Glyphs */}
+          <div className="flex-1 overflow-auto">
+            {!activeIntradayPair ? (
+              <div className="px-6 py-12 text-center text-xs text-slate-500">
+                No target slot available for inspection under current filters.
+              </div>
+            ) : (
+              <table className="w-full border-collapse text-left text-xs">
+                <thead className="sticky top-0 z-10 border-b border-[#1E293B] bg-[#0D131E] text-slate-400">
+                  <tr>
+                    <th className="px-4 py-2.5 font-medium">Calendar Date (UTC)</th>
+                    <th className="px-3 py-2.5 font-medium">Anchor Candle</th>
+                    <th className="px-3 py-2.5 text-right font-medium">
+                      Anchor ({activeIntradayPair.anchorTimeframe} {activeIntradayPair.anchorSlotKey})
+                    </th>
+                    <th className="px-3 py-2.5 font-medium">Target Candle</th>
+                    <th className="px-3 py-2.5 text-right font-medium">
+                      Target ({activeIntradayPair.targetTimeframe} {activeIntradayPair.targetSlotKey})
+                    </th>
+                    <th className="px-4 py-2.5 text-right font-medium">Result</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-[#1E293B] font-mono tabular-nums">
+                  {pageDays.length === 0 ? (
+                    <tr>
+                      <td colSpan={6} className="px-6 py-10 text-center font-sans text-slate-500">
+                        No calendar days match this filter.
+                      </td>
+                    </tr>
+                  ) : (
+                    pageDays.map((r) => (
+                      <tr
+                        key={`${r.dateStr}-${r.anchorCandle.timestamp}-${r.targetCandle.timestamp}`}
+                        className={
+                          r.isMatch
+                            ? 'hover:bg-emerald-500/[0.04]'
+                            : 'bg-red-500/[0.03] hover:bg-red-500/[0.06]'
+                        }
+                      >
+                        <td className="whitespace-nowrap px-4 py-2.5 font-semibold text-slate-200">
+                          {r.dateStr}
+                        </td>
+                        <td className="px-3 py-2">
+                          <div className="flex items-center gap-2">
+                            <SingleCandleGlyph candle={r.anchorCandle} width={16} height={26} />
+                            <span
+                              className={`text-[11px] font-semibold ${
+                                r.anchorCandle.candleType === 'BULLISH'
+                                  ? 'text-emerald-400'
+                                  : r.anchorCandle.candleType === 'BEARISH'
+                                    ? 'text-red-400'
+                                    : 'text-amber-400'
+                              }`}
+                            >
+                              {r.anchorCandle.candleType}
+                            </span>
+                          </div>
+                        </td>
+                        <td className="whitespace-nowrap px-3 py-2.5 text-right text-slate-300">
+                          <div>
+                            O {r.anchorCandle.open} · H {r.anchorCandle.high}
+                          </div>
+                          <div className="text-[11px] text-slate-400">
+                            L {r.anchorCandle.low} · C {r.anchorCandle.close}
+                          </div>
+                        </td>
+                        <td className="px-3 py-2">
+                          <div className="flex items-center gap-2">
+                            <SingleCandleGlyph candle={r.targetCandle} width={16} height={26} />
+                            <span
+                              className={`text-[11px] font-semibold ${
+                                r.targetCandle.candleType === 'BULLISH'
+                                  ? 'text-emerald-400'
+                                  : r.targetCandle.candleType === 'BEARISH'
+                                    ? 'text-red-400'
+                                    : 'text-amber-400'
+                              }`}
+                            >
+                              {r.targetCandle.candleType}
+                            </span>
+                          </div>
+                        </td>
+                        <td className="whitespace-nowrap px-3 py-2.5 text-right text-slate-300">
+                          <div>
+                            O {r.targetCandle.open} · H {r.targetCandle.high}
+                          </div>
+                          <div className="text-[11px] text-slate-400">
+                            L {r.targetCandle.low} · C {r.targetCandle.close}
+                          </div>
+                        </td>
+                        <td className="whitespace-nowrap px-4 py-2.5 text-right font-semibold">
+                          {r.isMatch ? (
+                            <span className="text-emerald-400">MATCH ({r.matchDirection})</span>
+                          ) : r.targetCandle.candleType === 'DOJI' ? (
+                            <span className="text-amber-400">TARGET DOJI</span>
+                          ) : (
+                            <span className="text-red-400">MISMATCH</span>
+                          )}
+                        </td>
+                      </tr>
+                    ))
+                  )}
+                </tbody>
+              </table>
+            )}
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   // =========================================================================
   // BEST MATCHED CANDLES INSPECTION VIEW

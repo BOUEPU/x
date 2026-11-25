@@ -1,5 +1,8 @@
 import { classifyAndAuditCandles } from './audit';
-import { runBestMatchedCandlesFromCandles } from './correlation';
+import {
+  runBestMatchedCandlesFromCandles,
+  runIntradaySlotMatchFromCandles,
+} from './correlation';
 import {
   parseCsvDataLine,
   sortAndDeduplicateCandles,
@@ -10,6 +13,8 @@ import {
   BestMatchProgress,
   BestMatchResult,
   EnrichedCandle,
+  IntradaySlotMatchConfig,
+  IntradaySlotMatchResult,
   MalformedRow,
   RawCandle,
   TimeframeDataset,
@@ -28,7 +33,16 @@ export interface WorkerBestMatchRequest {
   config: BestMatchConfig;
 }
 
-export type WorkerRequest = WorkerParseRequest | WorkerBestMatchRequest;
+export interface WorkerIntradaySlotRequest {
+  type: 'intraday_slot_match';
+  candlesByTf: Partial<Record<TimeframeId, EnrichedCandle[]>>;
+  config: IntradaySlotMatchConfig;
+}
+
+export type WorkerRequest =
+  | WorkerParseRequest
+  | WorkerBestMatchRequest
+  | WorkerIntradaySlotRequest;
 
 export type WorkerParseResponse =
   | {
@@ -60,6 +74,18 @@ export type WorkerParseResponse =
   | {
       type: 'best_match_error';
       errorMessage: string;
+    }
+  | {
+      type: 'intraday_progress';
+      progress: BestMatchProgress;
+    }
+  | {
+      type: 'intraday_complete';
+      result: IntradaySlotMatchResult;
+    }
+  | {
+      type: 'intraday_error';
+      errorMessage: string;
     };
 
 const CHUNK_SIZE_BYTES = 2 * 1024 * 1024; // 2 MB chunks for smooth streaming of multi-year 1MIN CSVs
@@ -89,6 +115,34 @@ self.onmessage = async (event: MessageEvent<WorkerRequest>) => {
       const errMsg: WorkerParseResponse = {
         type: 'best_match_error',
         errorMessage: err instanceof Error ? err.message : 'Best Match worker failed.',
+      };
+      self.postMessage(errMsg);
+    }
+    return;
+  }
+
+  if (msg.type === 'intraday_slot_match') {
+    try {
+      let lastPost = 0;
+      const result = runIntradaySlotMatchFromCandles(
+        msg.candlesByTf,
+        msg.config,
+        (progress) => {
+          const now = Date.now();
+          if (now - lastPost >= 60 || progress.percent >= 100) {
+            lastPost = now;
+            const pMsg: WorkerParseResponse = { type: 'intraday_progress', progress };
+            self.postMessage(pMsg);
+          }
+        },
+        true
+      );
+      const doneMsg: WorkerParseResponse = { type: 'intraday_complete', result };
+      self.postMessage(doneMsg);
+    } catch (err) {
+      const errMsg: WorkerParseResponse = {
+        type: 'intraday_error',
+        errorMessage: err instanceof Error ? err.message : 'Intraday Slot Match worker failed.',
       };
       self.postMessage(errMsg);
     }

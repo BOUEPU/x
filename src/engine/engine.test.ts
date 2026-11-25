@@ -18,14 +18,17 @@ import {
   computeDatasetFeatures,
   filterAndRankBestMatches,
   filterAndRankCandidates,
+  filterAndRankIntradayMatches,
   getLoadedTimeframeIds,
   runBestMatchedCandlesSearch,
   runCorrelationAnalysis,
+  runIntradaySlotMatchSearch,
 } from './correlation';
 import {
   AnalysisConfig,
   BestMatchConfig,
   EnrichedCandle,
+  IntradaySlotMatchConfig,
   TimeframeDataset,
   TimeframeId,
 } from './types';
@@ -624,5 +627,215 @@ test('Mode B Single-File Pattern Search works with 1 CSV across K=1,2,3 referenc
   });
   assert.ok(bullOnly.every((m) => m.dominantDirection === 'BULLISH'));
 });
+
+test('Mode 1A Single-Anchor Intraday Slot Match (00:01 UTC) evaluates same-TF & cross-TF daily recurrence accurately', () => {
+  // 5 UTC calendar days:
+  // Day 1 (Jan 01): 1MIN 00:01 BULL
+  // Day 2 (Jan 02): 1MIN 00:01 BEAR
+  // Day 3 (Jan 03): 1MIN 00:01 DOJI (anchor Doji -> must be skipped completely!)
+  // Day 4 (Jan 04): 1MIN 00:01 BULL
+  // Day 5 (Jan 05): 1MIN 00:01 BEAR
+  //
+  // Candidates:
+  // - 1MIN 14:30: BULL, BEAR, BULL (skipped), BULL, BEAR => 4/4 = 100% (2 Bull, 2 Bear)
+  // - 1MIN 09:00: BULL, BEAR, BEAR (skipped), BEAR, BEAR => 3/4 = 75% (1 Bull, 2 Bear)
+  // - 15MIN 08:15: BULL, BEAR, BULL (skipped), BULL, BEAR => 4/4 = 100% (2 Bull, 2 Bear)
+  // - 1H 20:00: BULL, BULL, BULL (skipped), BULL, BULL => 2/4 = 50% (2 Bull, 0 Bear)
+  const csv1Min = [
+    'Time (UTC),Open,High,Low,Close,Volume ',
+    // Day 1
+    '2024.01.01 00:01:00,100,105,99,104,1',   // BULL
+    '2024.01.01 09:00:00,100,105,99,103,1',   // BULL
+    '2024.01.01 14:30:00,100,106,99,105,1',   // BULL
+    // Day 2
+    '2024.01.02 00:01:00,105,106,100,101,1',  // BEAR
+    '2024.01.02 09:00:00,105,106,100,102,1',  // BEAR
+    '2024.01.02 14:30:00,105,106,99,100,1',   // BEAR
+    // Day 3 (Anchor DOJI -> excluded!)
+    '2024.01.03 00:01:00,100,102,98,100,1',   // DOJI
+    '2024.01.03 09:00:00,100,102,98,99,1',    // BEAR
+    '2024.01.03 14:30:00,100,105,99,103,1',   // BULL
+    // Day 4
+    '2024.01.04 00:01:00,103,108,102,107,1',  // BULL
+    '2024.01.04 09:00:00,107,108,104,105,1',  // BEAR (mismatch)
+    '2024.01.04 14:30:00,105,110,104,109,1',  // BULL
+    // Day 5
+    '2024.01.05 00:01:00,109,110,104,105,1',  // BEAR
+    '2024.01.05 09:00:00,105,106,100,101,1',  // BEAR
+    '2024.01.05 14:30:00,101,102,97,98,1',    // BEAR
+  ].join('\n');
+
+  const csv15M = [
+    'Time (UTC),Open,High,Low,Close,Volume ',
+    '2024.01.01 08:15:00,100,110,99,108,2',
+    '2024.01.02 08:15:00,108,109,100,102,2',
+    '2024.01.03 08:15:00,102,106,101,105,2',
+    '2024.01.04 08:15:00,105,112,104,111,2',
+    '2024.01.05 08:15:00,111,112,103,104,2',
+  ].join('\n');
+
+  const csv1H = [
+    'Time (UTC),Open,High,Low,Close,Volume ',
+    '2024.01.01 20:00:00,100,110,99,105,5',
+    '2024.01.02 20:00:00,105,110,104,109,5',
+    '2024.01.03 20:00:00,109,115,108,114,5',
+    '2024.01.04 20:00:00,114,120,113,118,5',
+    '2024.01.05 20:00:00,118,125,117,122,5',
+  ].join('\n');
+
+  const ds1Min = buildDataset('1MIN', csv1Min);
+  const ds15M = buildDataset('15MIN', csv15M);
+  const ds1H = buildDataset('1H', csv1H);
+  const datasets = { '1MIN': ds1Min, '15MIN': ds15M, '1H': ds1H };
+
+  const baseCfg: IntradaySlotMatchConfig = {
+    scopeMode: 'single_anchor',
+    anchorTimeframe: '1MIN',
+    anchorSlotKey: '00:01',
+    targetTimeframes: ['1MIN', '15MIN', '1H'],
+    directionFilter: 'any_non_doji',
+    excludeSelfSlot: true,
+    minCoOccurringDays: 3,
+    minMatchRatePct: 50,
+    maxResults: 25,
+    startDateUtc: '',
+    endDateUtc: '',
+  };
+
+  const res = runIntradaySlotMatchSearch(datasets, baseCfg);
+  assert.equal(res.totalValidDaysEvaluated, 4); // Day 3 skipped
+  assert.equal(res.anchorSlotKey, '00:01');
+  // Self slot 1MIN 00:01 excluded
+  assert.ok(
+    !res.matches.some((m) => m.targetTimeframe === '1MIN' && m.targetSlotKey === '00:01')
+  );
+
+  // Top 4 slots: 1MIN 14:30 (100%), 15MIN 08:15 (100%), 1MIN 09:00 (75%), 1H 20:00 (50%)
+  assert.equal(res.matches.length, 4);
+  assert.equal(res.matches[0].targetTimeframe, '1MIN');
+  assert.equal(res.matches[0].targetSlotKey, '14:30');
+  assert.equal(res.matches[0].matchRatePct, 100);
+  assert.equal(res.matches[0].matchedDays, 4);
+  assert.equal(res.matches[0].totalCoOccurringDays, 4);
+  assert.equal(res.matches[0].bullishMatches, 2);
+  assert.equal(res.matches[0].bearishMatches, 2);
+  assert.equal(res.matches[0].dayRecords.length, 4);
+  assert.ok(res.matches[0].dayRecords.every((r) => r.dateStr !== '2024-01-03'));
+
+  assert.equal(res.matches[1].targetTimeframe, '15MIN');
+  assert.equal(res.matches[1].targetSlotKey, '08:15');
+  assert.equal(res.matches[1].matchRatePct, 100);
+
+  assert.equal(res.matches[2].targetTimeframe, '1MIN');
+  assert.equal(res.matches[2].targetSlotKey, '09:00');
+  assert.equal(res.matches[2].matchRatePct, 75);
+  assert.equal(res.matches[2].bullishMatches, 1);
+  assert.equal(res.matches[2].bearishMatches, 2);
+
+  // Bearish-only direction filter check: 1H 20:00 had 0 bearish matches -> drops to 0%
+  const bearRes = runIntradaySlotMatchSearch(datasets, {
+    ...baseCfg,
+    directionFilter: 'bearish_only',
+    minMatchRatePct: 0,
+  });
+  const hr20 = bearRes.matches.find((m) => m.targetTimeframe === '1H' && m.targetSlotKey === '20:00')!;
+  assert.equal(hr20.matchRatePct, 0);
+  assert.equal(hr20.bearishMatches, 0);
+
+  // Filter helper narrows to 15MIN target only
+  const tfFiltered = filterAndRankIntradayMatches(res.matches, {
+    searchQuery: '',
+    targetTimeframeFilter: '15MIN',
+    directionBiasFilter: 'all',
+    minRateOverride: 0,
+  });
+  assert.equal(tfFiltered.length, 1);
+  assert.equal(tfFiltered[0].targetSlotKey, '08:15');
+});
+
+test('Mode 1B Full-Matrix Intraday Bitset engine matches Single-Anchor results bit-for-bit', () => {
+  const csv15M = [
+    'Time (UTC),Open,High,Low,Close,Volume ',
+    // Day 1
+    '2024.02.01 00:00:00,100,105,99,104,1',  // BULL
+    '2024.02.01 04:00:00,104,109,103,108,1', // BULL
+    '2024.02.01 12:00:00,108,109,103,104,1', // BEAR
+    // Day 2
+    '2024.02.02 00:00:00,104,105,98,100,1',  // BEAR
+    '2024.02.02 04:00:00,100,101,95,96,1',   // BEAR
+    '2024.02.02 12:00:00,96,102,95,101,1',   // BULL
+    // Day 3
+    '2024.02.03 00:00:00,101,107,100,106,1', // BULL
+    '2024.02.03 04:00:00,106,112,105,111,1', // BULL
+    '2024.02.03 12:00:00,111,112,110,111,1', // DOJI
+    // Day 4
+    '2024.02.04 00:00:00,111,112,106,107,1', // BEAR
+    '2024.02.04 04:00:00,107,108,101,102,1', // BEAR
+    '2024.02.04 12:00:00,102,109,101,108,1', // BULL
+  ].join('\n');
+
+  const csv1H = [
+    'Time (UTC),Open,High,Low,Close,Volume ',
+    '2024.02.01 08:00:00,100,106,99,105,2',  // BULL
+    '2024.02.02 08:00:00,105,106,99,100,2',  // BEAR
+    '2024.02.03 08:00:00,100,108,99,107,2',  // BULL
+    '2024.02.04 08:00:00,107,108,102,103,2', // BEAR
+  ].join('\n');
+
+  const datasets = {
+    '15MIN': buildDataset('15MIN', csv15M),
+    '1H': buildDataset('1H', csv1H),
+  };
+
+  for (const directionFilter of ['any_non_doji', 'bullish_only', 'bearish_only'] as const) {
+    const matrixRes = runIntradaySlotMatchSearch(datasets, {
+      scopeMode: 'full_matrix',
+      anchorTimeframe: '15MIN',
+      anchorSlotKey: '00:00',
+      targetTimeframes: ['15MIN', '1H'],
+      directionFilter,
+      excludeSelfSlot: true,
+      minCoOccurringDays: 2,
+      minMatchRatePct: 0,
+      maxResults: 25,
+      startDateUtc: '',
+      endDateUtc: '',
+    });
+
+    assert.equal(matrixRes.totalAnchorSlotsEvaluated, 3);
+    assert.equal(matrixRes.matrixSummaries.length, 3);
+
+    // Compare every anchor summary's top targets directly against Single-Anchor mode
+    for (const summary of matrixRes.matrixSummaries) {
+      const singleRes = runIntradaySlotMatchSearch(datasets, {
+        scopeMode: 'single_anchor',
+        anchorTimeframe: '15MIN',
+        anchorSlotKey: summary.anchorSlotKey,
+        targetTimeframes: ['15MIN', '1H'],
+        directionFilter,
+        excludeSelfSlot: true,
+        minCoOccurringDays: 2,
+        minMatchRatePct: 0,
+        maxResults: 10,
+        startDateUtc: '',
+        endDateUtc: '',
+      });
+
+      assert.equal(summary.topTargets.length, singleRes.matches.length);
+      for (let i = 0; i < summary.topTargets.length; i++) {
+        const mRow = summary.topTargets[i];
+        const sRow = singleRes.matches[i];
+        assert.equal(mRow.targetTimeframe, sRow.targetTimeframe);
+        assert.equal(mRow.targetSlotKey, sRow.targetSlotKey);
+        assert.equal(mRow.matchedDays, sRow.matchedDays);
+        assert.equal(mRow.totalCoOccurringDays, sRow.totalCoOccurringDays);
+        assert.equal(mRow.matchRatePct, sRow.matchRatePct);
+        assert.equal(mRow.bullishMatches, sRow.bullishMatches);
+        assert.equal(mRow.bearishMatches, sRow.bearishMatches);
+      }
+    }
+  }
+});
+
 
 

@@ -11,27 +11,40 @@ import {
   DEFAULT_COLLECTOR_GROUPING,
 } from './engine/collector';
 import {
+  extractUtcIntradaySlot,
   filterAndRankBestMatches,
   filterAndRankCandidates,
+  filterAndRankIntradayMatches,
+  filterIntradayMatrixSummaries,
   getAvailableSlotsForTimeframe,
+  getIntradayTimeSlotOptions,
+  hasNonZeroSecondsInCandles,
   runCorrelationAnalysis,
 } from './engine/correlation';
 import { parseTimeframeFile } from './engine/parseFile';
 import {
   exportBestMatchesReportPdf,
   exportCorrelationReportPdf,
+  exportIntradaySlotReportPdf,
 } from './engine/pdfExport';
-import { executeBestMatchSearchAsync } from './engine/runBestMatch';
+import {
+  executeBestMatchSearchAsync,
+  executeIntradaySlotMatchAsync,
+} from './engine/runBestMatch';
 import {
   AnalysisConfig,
   AnalysisResult,
   BestMatchConfig,
+  BestMatchEngineSubMode,
   BestMatchFilterState,
   BestMatchProgress,
   BestMatchResult,
   CollectedCandleSlot,
   CollectorConfig,
   CollectorResult,
+  IntradaySlotFilterState,
+  IntradaySlotMatchConfig,
+  IntradaySlotMatchResult,
   ParseProgress,
   ResultsFilterState,
   StepEngineMode,
@@ -57,6 +70,13 @@ const DEFAULT_BEST_MATCH_FILTERS: BestMatchFilterState = {
   minScoreOverride: 0,
 };
 
+const DEFAULT_INTRADAY_FILTERS: IntradaySlotFilterState = {
+  searchQuery: '',
+  targetTimeframeFilter: 'ALL',
+  directionBiasFilter: 'all',
+  minRateOverride: 0,
+};
+
 function buildDefaultBestMatchConfig(
   datasets: Partial<Record<TimeframeId, TimeframeDataset>>
 ): BestMatchConfig {
@@ -75,6 +95,38 @@ function buildDefaultBestMatchConfig(
     includeVolumeWeight: false,
     minMatchScore: 75,
     maxResults: 25,
+    startDateUtc: '',
+    endDateUtc: '',
+  };
+}
+
+function buildDefaultIntradayConfig(
+  datasets: Partial<Record<TimeframeId, TimeframeDataset>>
+): IntradaySlotMatchConfig {
+  const loadedIds = TIMEFRAMES.filter(
+    (tf) => datasets[tf.id] && datasets[tf.id]!.candles.length > 0
+  ).map((tf) => tf.id);
+
+  const intradayLoaded = loadedIds.filter((id) => TIMEFRAME_MAP[id].isIntraday);
+  const anchorTf = intradayLoaded[0] ?? loadedIds[0] ?? '1MIN';
+  const anchorCandles = datasets[anchorTf]?.candles ?? [];
+  const slotOptions = getIntradayTimeSlotOptions(anchorCandles);
+  const defaultSlot =
+    slotOptions.find((o) => o.key === '00:01')?.key ??
+    slotOptions.find((o) => o.key === '00:00')?.key ??
+    slotOptions[0]?.key ??
+    '00:00';
+
+  return {
+    scopeMode: 'single_anchor',
+    anchorTimeframe: anchorTf,
+    anchorSlotKey: defaultSlot,
+    targetTimeframes: loadedIds.length > 0 ? loadedIds : [anchorTf],
+    directionFilter: 'any_non_doji',
+    excludeSelfSlot: true,
+    minCoOccurringDays: 5,
+    minMatchRatePct: 60,
+    maxResults: 50,
     startDateUtc: '',
     endDateUtc: '',
   };
@@ -135,13 +187,16 @@ export default function App() {
   const [selectedPreviewTf, setSelectedPreviewTf] = useState<TimeframeId | null>(null);
 
   const [engineMode, setEngineMode] = useState<StepEngineMode>('best_matches');
+  const [bestMatchSubMode, setBestMatchSubMode] =
+    useState<BestMatchEngineSubMode>('intraday_slot');
+
   const [config, setConfig] = useState<AnalysisConfig>(() => buildDefaultConfig({}));
   const [prefilledTargetNotice, setPrefilledTargetNotice] = useState<string | null>(null);
   const [analysisResult, setAnalysisResult] = useState<AnalysisResult | null>(null);
   const [isRunningAnalysis, setIsRunningAnalysis] = useState(false);
   const [filters, setFilters] = useState<ResultsFilterState>(DEFAULT_FILTERS);
 
-  // Best Matched Candles Search state
+  // Best Matched Candles (Geometric / Multi-TF) Search state
   const [bestMatchConfig, setBestMatchConfig] = useState<BestMatchConfig>(() =>
     buildDefaultBestMatchConfig({})
   );
@@ -151,6 +206,16 @@ export default function App() {
   const [bestMatchFilters, setBestMatchFilters] = useState<BestMatchFilterState>(
     DEFAULT_BEST_MATCH_FILTERS
   );
+
+  // Intraday Time-Slot Direction Correlation & Full-Matrix state
+  const [intradayConfig, setIntradayConfig] = useState<IntradaySlotMatchConfig>(() =>
+    buildDefaultIntradayConfig({})
+  );
+  const [intradayResult, setIntradayResult] = useState<IntradaySlotMatchResult | null>(null);
+  const [intradayFilters, setIntradayFilters] = useState<IntradaySlotFilterState>(
+    DEFAULT_INTRADAY_FILTERS
+  );
+  const [prefilledIntradayNotice, setPrefilledIntradayNotice] = useState<string | null>(null);
 
   // Candle Data Collector state
   const [collectorConfig, setCollectorConfig] = useState<CollectorConfig>({
@@ -173,7 +238,11 @@ export default function App() {
 
   const isParsingAny = Object.keys(parseProgress).length > 0;
   const activeHasResults =
-    engineMode === 'best_matches' ? Boolean(bestMatchResult) : Boolean(analysisResult);
+    engineMode === 'best_matches'
+      ? bestMatchSubMode === 'intraday_slot'
+        ? Boolean(intradayResult)
+        : Boolean(bestMatchResult)
+      : Boolean(analysisResult);
 
   const maxUnlockedStep: 1 | 2 | 3 | 4 = useMemo(() => {
     if (loadedTimeframes.length === 0) return 1;
@@ -207,6 +276,7 @@ export default function App() {
       setSelectedPreviewTf(tf);
       setAnalysisResult(null);
       setBestMatchResult(null);
+      setIntradayResult(null);
       setCollectorResult(null);
     } catch (err) {
       const message =
@@ -235,6 +305,7 @@ export default function App() {
     setSelectedPreviewTf((cur) => (cur === tf ? null : cur));
     setAnalysisResult(null);
     setBestMatchResult(null);
+    setIntradayResult(null);
     setCollectorResult(null);
   }, []);
 
@@ -244,9 +315,11 @@ export default function App() {
     setSelectedPreviewTf(null);
     setAnalysisResult(null);
     setBestMatchResult(null);
+    setIntradayResult(null);
     setBestMatchProgress(null);
     setCollectorResult(null);
     setPrefilledTargetNotice(null);
+    setPrefilledIntradayNotice(null);
     setCurrentStep(1);
   }, []);
 
@@ -327,6 +400,43 @@ export default function App() {
           referenceTimestamp: nextRefTs,
         };
       });
+
+      setIntradayConfig((prev) => {
+        if (loadedIds.length === 0) return prev;
+        const anchorExists = Boolean(
+          targetDatasets[prev.anchorTimeframe] &&
+            targetDatasets[prev.anchorTimeframe]!.candles.length > 0
+        );
+        const intradayLoaded = loadedIds.filter((id) => TIMEFRAME_MAP[id].isIntraday);
+        const nextAnchorTf = anchorExists
+          ? prev.anchorTimeframe
+          : intradayLoaded[0] ?? loadedIds[0];
+
+        const validTargets = prev.targetTimeframes.filter((tf) =>
+          Boolean(targetDatasets[tf] && targetDatasets[tf]!.candles.length > 0)
+        );
+        const nextTargets =
+          validTargets.length > 0
+            ? validTargets
+            : loadedIds;
+
+        const anchorCandles = targetDatasets[nextAnchorTf]?.candles ?? [];
+        const slotOptions = getIntradayTimeSlotOptions(anchorCandles);
+        const slotValid = slotOptions.some((o) => o.key === prev.anchorSlotKey);
+        const nextSlotKey = slotValid
+          ? prev.anchorSlotKey
+          : slotOptions.find((o) => o.key === '00:01')?.key ??
+            slotOptions.find((o) => o.key === '00:00')?.key ??
+            slotOptions[0]?.key ??
+            '00:00';
+
+        return {
+          ...prev,
+          anchorTimeframe: nextAnchorTf,
+          anchorSlotKey: nextSlotKey,
+          targetTimeframes: nextTargets,
+        };
+      });
     },
     [analysisResult, bestMatchResult, prefilledTargetNotice]
   );
@@ -358,6 +468,43 @@ export default function App() {
       setEngineMode('principal_target');
       setConfig(prefilled);
       setPrefilledTargetNotice(slot.displayLabel);
+      setCurrentStep(3);
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+    },
+    [datasets, collectorConfig.startDateUtc, collectorConfig.endDateUtc]
+  );
+
+  const handleOpenInBestMatchFromCollector = useCallback(
+    (slot: CollectedCandleSlot) => {
+      const loadedIds = TIMEFRAMES.filter(
+        (t) => datasets[t.id] && datasets[t.id]!.candles.length > 0
+      ).map((t) => t.id);
+
+      const dsCandles = datasets[slot.timeframe]?.candles ?? slot.history;
+      const includeSec = hasNonZeroSecondsInCandles(dsCandles);
+      let resolvedSlotKey = slot.slotKey;
+
+      if (!/^\d{2}:\d{2}(:\d{2})?$/.test(resolvedSlotKey)) {
+        if (slot.history.length > 0) {
+          resolvedSlotKey = extractUtcIntradaySlot(slot.history[0].timestamp, includeSec).key;
+        } else {
+          const opts = getIntradayTimeSlotOptions(dsCandles);
+          resolvedSlotKey = opts[0]?.key ?? '00:00';
+        }
+      }
+
+      setEngineMode('best_matches');
+      setBestMatchSubMode('intraday_slot');
+      setIntradayConfig((prev) => ({
+        ...prev,
+        scopeMode: 'single_anchor',
+        anchorTimeframe: slot.timeframe,
+        anchorSlotKey: resolvedSlotKey,
+        targetTimeframes: loadedIds.length > 0 ? loadedIds : [slot.timeframe],
+        startDateUtc: collectorConfig.startDateUtc || prev.startDateUtc,
+        endDateUtc: collectorConfig.endDateUtc || prev.endDateUtc,
+      }));
+      setPrefilledIntradayNotice(`${slot.timeframe} — ${resolvedSlotKey} UTC`);
       setCurrentStep(3);
       window.scrollTo({ top: 0, behavior: 'smooth' });
     },
@@ -402,6 +549,23 @@ export default function App() {
     }
   }, [datasets, bestMatchConfig]);
 
+  const executeIntradayMatch = useCallback(async () => {
+    setIsRunningBestMatch(true);
+    setBestMatchProgress({ percent: 5, scanned: 0, total: 100, stage: 'indexing' });
+    try {
+      const res = await executeIntradaySlotMatchAsync(datasets, intradayConfig, (progress) => {
+        setBestMatchProgress(progress);
+      });
+      setIntradayResult(res);
+      setIntradayFilters(DEFAULT_INTRADAY_FILTERS);
+      setCurrentStep(4);
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+    } finally {
+      setIsRunningBestMatch(false);
+      setBestMatchProgress(null);
+    }
+  }, [datasets, intradayConfig]);
+
   const handleDateRangeChangeOnResults = useCallback(
     (startDateUtc: string, endDateUtc: string) => {
       const nextConfig: AnalysisConfig = {
@@ -424,14 +588,35 @@ export default function App() {
       goToStep(3);
     } else if (currentStep === 3) {
       if (engineMode === 'best_matches') {
-        void executeBestMatch();
+        if (bestMatchSubMode === 'intraday_slot') {
+          void executeIntradayMatch();
+        } else {
+          void executeBestMatch();
+        }
       } else {
         executeAnalysis(config, true);
       }
     } else if (currentStep === 4) {
-      if (engineMode === 'best_matches' && bestMatchResult) {
-        const filtered = filterAndRankBestMatches(bestMatchResult.matches, bestMatchFilters);
-        exportBestMatchesReportPdf(bestMatchResult, filtered, bestMatchFilters);
+      if (engineMode === 'best_matches') {
+        if (bestMatchSubMode === 'intraday_slot' && intradayResult) {
+          const filteredMatches = filterAndRankIntradayMatches(
+            intradayResult.matches,
+            intradayFilters
+          );
+          const filteredMatrix = filterIntradayMatrixSummaries(
+            intradayResult.matrixSummaries,
+            intradayFilters
+          );
+          exportIntradaySlotReportPdf(
+            intradayResult,
+            filteredMatches,
+            filteredMatrix,
+            intradayFilters
+          );
+        } else if (bestMatchSubMode === 'geometric_pattern' && bestMatchResult) {
+          const filtered = filterAndRankBestMatches(bestMatchResult.matches, bestMatchFilters);
+          exportBestMatchesReportPdf(bestMatchResult, filtered, bestMatchFilters);
+        }
       } else if (engineMode === 'principal_target' && analysisResult) {
         const filtered = filterAndRankCandidates(analysisResult.candidates, filters);
         exportCorrelationReportPdf(analysisResult, filtered, filters, datasets);
@@ -443,8 +628,16 @@ export default function App() {
 
   const step3BestMatchBlocked =
     engineMode === 'best_matches' &&
+    bestMatchSubMode === 'geometric_pattern' &&
     bestMatchConfig.scope === 'multi_tf' &&
     bestMatchConfig.selectedTimeframes.length < 2;
+
+  const step3IntradayBlocked =
+    engineMode === 'best_matches' &&
+    bestMatchSubMode === 'intraday_slot' &&
+    (!datasets[intradayConfig.anchorTimeframe] ||
+      intradayConfig.targetTimeframes.length === 0 ||
+      (intradayConfig.scopeMode === 'single_anchor' && !intradayConfig.anchorSlotKey));
 
   const primaryActionMeta = useMemo(() => {
     switch (currentStep) {
@@ -462,6 +655,18 @@ export default function App() {
         };
       case 3:
         if (engineMode === 'best_matches') {
+          if (bestMatchSubMode === 'intraday_slot') {
+            return {
+              label: isRunningBestMatch
+                ? 'Scanning Slots...'
+                : intradayConfig.scopeMode === 'full_matrix'
+                  ? 'Collect All Slots'
+                  : 'Find Slot Matches',
+              disabled:
+                loadedTimeframes.length === 0 || isRunningBestMatch || step3IntradayBlocked,
+              isExport: false,
+            };
+          }
           return {
             label: isRunningBestMatch ? 'Searching...' : 'Search Matches',
             disabled:
@@ -492,8 +697,11 @@ export default function App() {
     loadedTimeframes.length,
     isParsingAny,
     engineMode,
+    bestMatchSubMode,
+    intradayConfig.scopeMode,
     isRunningBestMatch,
     step3BestMatchBlocked,
+    step3IntradayBlocked,
     isRunningAnalysis,
     activeHasResults,
   ]);
@@ -542,6 +750,8 @@ export default function App() {
             datasets={datasets}
             engineMode={engineMode}
             onChangeEngineMode={setEngineMode}
+            bestMatchSubMode={bestMatchSubMode}
+            onChangeBestMatchSubMode={setBestMatchSubMode}
             config={config}
             prefilledTargetNotice={prefilledTargetNotice}
             onDismissPrefilledNotice={() => setPrefilledTargetNotice(null)}
@@ -556,6 +766,14 @@ export default function App() {
             onRunBestMatch={() => void executeBestMatch()}
             isRunningBestMatch={isRunningBestMatch}
             bestMatchProgress={bestMatchProgress}
+            intradayConfig={intradayConfig}
+            onChangeIntradayConfig={(next) => {
+              setIntradayConfig(next);
+              setPrefilledIntradayNotice(null);
+            }}
+            onRunIntradayMatch={() => void executeIntradayMatch()}
+            prefilledIntradayNotice={prefilledIntradayNotice}
+            onDismissPrefilledIntradayNotice={() => setPrefilledIntradayNotice(null)}
             onBack={() => goToStep(2)}
           />
         )}
@@ -563,6 +781,7 @@ export default function App() {
         {currentStep === 4 && activeHasResults && (
           <StepResults
             engineMode={engineMode}
+            bestMatchSubMode={bestMatchSubMode}
             result={analysisResult}
             datasets={datasets}
             filters={filters}
@@ -571,6 +790,9 @@ export default function App() {
             bestMatchResult={bestMatchResult}
             bestMatchFilters={bestMatchFilters}
             onChangeBestMatchFilters={setBestMatchFilters}
+            intradayResult={intradayResult}
+            intradayFilters={intradayFilters}
+            onChangeIntradayFilters={setIntradayFilters}
             onBackToConfigure={() => goToStep(3)}
           />
         )}
@@ -583,6 +805,7 @@ export default function App() {
             onChangeConfig={setCollectorConfig}
             onResultReady={setCollectorResult}
             onUseAsTargetCandle={handleUseAsTargetCandle}
+            onOpenInBestMatch={handleOpenInBestMatchFromCollector}
           />
         )}
       </main>

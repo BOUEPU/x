@@ -4,6 +4,8 @@ import {
   ArrowDown,
   ArrowUp,
   ArrowUpDown,
+  ChevronLeft,
+  ChevronRight,
   Download,
   FileDown,
   RotateCcw,
@@ -13,28 +15,39 @@ import {
 import {
   filterAndRankBestMatches,
   filterAndRankCandidates,
+  filterAndRankIntradayMatches,
+  filterIntradayMatrixSummaries,
   getDirectionScore,
 } from '../engine/correlation';
 import {
   downloadBestMatchesCsv,
   downloadCorrelationResultsCsv,
+  downloadIntradayMatrixCsv,
+  downloadIntradaySlotMatchesCsv,
 } from '../engine/csvExport';
 import {
   exportBestMatchesReportPdf,
   exportCorrelationReportPdf,
+  exportIntradaySlotReportPdf,
 } from '../engine/pdfExport';
 import {
   AnalysisResult,
+  BestMatchEngineSubMode,
   BestMatchFilterState,
   BestMatchItem,
   BestMatchResult,
   CandleType,
   DirectionFilter,
+  IntradayFullMatrixAnchorSummary,
+  IntradaySlotFilterState,
+  IntradaySlotMatchItem,
+  IntradaySlotMatchResult,
   PrincipalCandidateResult,
   ResultsFilterState,
   StepEngineMode,
   TimeframeDataset,
   TimeframeId,
+  TIMEFRAME_MAP,
   TimingRelation,
 } from '../engine/types';
 import { SnapshotStripGlyphs } from './CandleGlyph';
@@ -43,16 +56,21 @@ import { TopBarChart } from './TopBarChart';
 
 interface StepResultsProps {
   engineMode: StepEngineMode;
+  bestMatchSubMode: BestMatchEngineSubMode;
   // Principal vs Target props
   result: AnalysisResult | null;
   datasets: Partial<Record<TimeframeId, TimeframeDataset>>;
   filters: ResultsFilterState;
   onChangeFilters: (next: ResultsFilterState) => void;
   onDateRangeChange: (startDateUtc: string, endDateUtc: string) => void;
-  // Best Matched Candles props
+  // Best Matched Candles (Geometric / Multi-TF) props
   bestMatchResult: BestMatchResult | null;
   bestMatchFilters: BestMatchFilterState;
   onChangeBestMatchFilters: (next: BestMatchFilterState) => void;
+  // Intraday Time-Slot Direction Correlation props
+  intradayResult: IntradaySlotMatchResult | null;
+  intradayFilters: IntradaySlotFilterState;
+  onChangeIntradayFilters: (next: IntradaySlotFilterState) => void;
   onBackToConfigure: () => void;
 }
 
@@ -74,6 +92,23 @@ type MatchSortKey =
   | 'structuralScore'
   | 'volumeScore'
   | 'dominantDirection';
+
+type IntradayMatchSortKey =
+  | 'rank'
+  | 'targetTimeframe'
+  | 'targetSlot'
+  | 'matchedDays'
+  | 'matchRatePct'
+  | 'bullishMatches'
+  | 'bearishMatches';
+
+type IntradayMatrixSortKey =
+  | 'anchorSlot'
+  | 'validDays'
+  | 'bestTarget'
+  | 'matchedDays'
+  | 'matchRatePct'
+  | 'top5Avg';
 
 function renderTimingTag(relation: TimingRelation, detail: string) {
   const styles =
@@ -108,6 +143,7 @@ function renderDirectionLabel(dir: CandleType) {
 
 export function StepResults({
   engineMode,
+  bestMatchSubMode,
   result,
   datasets,
   filters,
@@ -116,6 +152,9 @@ export function StepResults({
   bestMatchResult,
   bestMatchFilters,
   onChangeBestMatchFilters,
+  intradayResult,
+  intradayFilters,
+  onChangeIntradayFilters,
   onBackToConfigure,
 }: StepResultsProps) {
   // Principal vs Target state
@@ -124,13 +163,134 @@ export function StepResults({
   const [selectedCandidate, setSelectedCandidate] =
     useState<PrincipalCandidateResult | null>(null);
 
-  // Best Matched Candles state
+  // Best Matched Candles (Geometric / Multi-TF) state
   const [matchSortKey, setMatchSortKey] = useState<MatchSortKey>('rank');
   const [matchSortDir, setMatchSortDir] = useState<'asc' | 'desc'>('asc');
   const [selectedMatch, setSelectedMatch] = useState<BestMatchItem | null>(null);
 
+  // Intraday Time-Slot Match state
+  const [intradaySortKey, setIntradaySortKey] = useState<IntradayMatchSortKey>('rank');
+  const [intradaySortDir, setIntradaySortDir] = useState<'asc' | 'desc'>('asc');
+  const [selectedIntradayMatch, setSelectedIntradayMatch] =
+    useState<IntradaySlotMatchItem | null>(null);
+
+  // Intraday Full-Matrix Leaderboard state
+  const [matrixSortKey, setMatrixSortKey] = useState<IntradayMatrixSortKey>('matchRatePct');
+  const [matrixSortDir, setMatrixSortDir] = useState<'desc' | 'asc'>('desc');
+  const [selectedMatrixRow, setSelectedMatrixRow] =
+    useState<IntradayFullMatrixAnchorSummary | null>(null);
+  const [matrixPage, setMatrixPage] = useState(1);
+  const [matrixPageSize, setMatrixPageSize] = useState(100);
+
   // =========================================================================
-  // BEST MATCHED CANDLES COMPUTED DATA
+  // INTRADAY TIME-SLOT CORRELATION COMPUTED DATA
+  // =========================================================================
+  const filteredIntradayMatches = useMemo(() => {
+    if (!intradayResult || intradayResult.scopeMode !== 'single_anchor') return [];
+    return filterAndRankIntradayMatches(intradayResult.matches, intradayFilters);
+  }, [intradayResult, intradayFilters]);
+
+  const rankedIntradayWithIndex = useMemo(
+    () => filteredIntradayMatches.map((m, idx) => ({ match: m, rank: idx + 1 })),
+    [filteredIntradayMatches]
+  );
+
+  const displayedIntradayMatches = useMemo(() => {
+    if (intradaySortKey === 'rank' && intradaySortDir === 'asc') {
+      return rankedIntradayWithIndex;
+    }
+    return rankedIntradayWithIndex.slice().sort((a, b) => {
+      const ma = a.match;
+      const mb = b.match;
+      let cmp = 0;
+      switch (intradaySortKey) {
+        case 'rank':
+          cmp = a.rank - b.rank;
+          break;
+        case 'targetTimeframe':
+          cmp =
+            TIMEFRAME_MAP[ma.targetTimeframe].rankOrder -
+            TIMEFRAME_MAP[mb.targetTimeframe].rankOrder;
+          break;
+        case 'targetSlot':
+          cmp = ma.targetSlotSortOrder - mb.targetSlotSortOrder;
+          break;
+        case 'matchedDays':
+          cmp = ma.matchedDays - mb.matchedDays;
+          break;
+        case 'matchRatePct':
+          cmp = ma.matchRatePct - mb.matchRatePct;
+          break;
+        case 'bullishMatches':
+          cmp = ma.bullishMatches - mb.bullishMatches;
+          break;
+        case 'bearishMatches':
+          cmp = ma.bearishMatches - mb.bearishMatches;
+          break;
+      }
+      return intradaySortDir === 'asc' ? cmp : -cmp;
+    });
+  }, [rankedIntradayWithIndex, intradaySortKey, intradaySortDir]);
+
+  const filteredMatrixSummaries = useMemo(() => {
+    if (!intradayResult || intradayResult.scopeMode !== 'full_matrix') return [];
+    return filterIntradayMatrixSummaries(intradayResult.matrixSummaries, intradayFilters);
+  }, [intradayResult, intradayFilters]);
+
+  const displayedMatrixRows = useMemo(() => {
+    const arr = filteredMatrixSummaries.slice();
+    arr.sort((a, b) => {
+      let cmp = 0;
+      switch (matrixSortKey) {
+        case 'anchorSlot':
+          cmp = a.anchorSlotSortOrder - b.anchorSlotSortOrder;
+          break;
+        case 'validDays':
+          cmp = a.totalValidAnchorDays - b.totalValidAnchorDays;
+          break;
+        case 'bestTarget': {
+          const ba = a.bestTarget ? `${a.bestTarget.targetTimeframe}_${a.bestTarget.targetSlotKey}` : '';
+          const bb = b.bestTarget ? `${b.bestTarget.targetTimeframe}_${b.bestTarget.targetSlotKey}` : '';
+          cmp = ba.localeCompare(bb);
+          break;
+        }
+        case 'matchedDays':
+          cmp = (a.bestTarget?.matchedDays ?? -1) - (b.bestTarget?.matchedDays ?? -1);
+          break;
+        case 'matchRatePct':
+          cmp = (a.bestTarget?.matchRatePct ?? -1) - (b.bestTarget?.matchRatePct ?? -1);
+          if (cmp === 0) {
+            cmp = (a.bestTarget?.matchedDays ?? -1) - (b.bestTarget?.matchedDays ?? -1);
+          }
+          break;
+        case 'top5Avg':
+          cmp = a.top5AvgMatchRatePct - b.top5AvgMatchRatePct;
+          break;
+      }
+      return matrixSortDir === 'asc' ? cmp : -cmp;
+    });
+    return arr;
+  }, [filteredMatrixSummaries, matrixSortKey, matrixSortDir]);
+
+  const strongestMatrixRow = useMemo(() => {
+    let best: IntradayFullMatrixAnchorSummary | null = null;
+    for (const row of filteredMatrixSummaries) {
+      if (!row.bestTarget) continue;
+      if (
+        !best ||
+        !best.bestTarget ||
+        row.bestTarget.matchRatePct > best.bestTarget.matchRatePct ||
+        (row.bestTarget.matchRatePct === best.bestTarget.matchRatePct &&
+          row.bestTarget.matchedDays > best.bestTarget.matchedDays)
+      ) {
+        best = row;
+      }
+    }
+    return best;
+  }, [filteredMatrixSummaries]);
+
+  // =========================================================================
+  // BEST MATCHED CANDLES (GEOMETRIC / MULTI-TF) COMPUTED DATA
   // =========================================================================
   const filteredMatches = useMemo(() => {
     if (!bestMatchResult) return [];
@@ -239,7 +399,896 @@ export function StepResults({
   }, [rankedWithIndex, sortKey, sortDir]);
 
   // =========================================================================
-  // VIEW 1: BEST MATCHED CANDLES DASHBOARD
+  // VIEW 1A: INTRADAY TIME-SLOT DIRECTION CORRELATION DASHBOARD
+  // =========================================================================
+  if (
+    engineMode === 'best_matches' &&
+    bestMatchSubMode === 'intraday_slot' &&
+    intradayResult
+  ) {
+    const isSingleAnchor = intradayResult.scopeMode === 'single_anchor';
+    const topSingle = filteredIntradayMatches[0] ?? null;
+
+    const handleResetIntradayFilters = () => {
+      onChangeIntradayFilters({
+        searchQuery: '',
+        targetTimeframeFilter: 'ALL',
+        directionBiasFilter: 'all',
+        minRateOverride: 0,
+      });
+      setMatrixPage(1);
+    };
+
+    const handleIntradaySort = (key: IntradayMatchSortKey) => {
+      if (intradaySortKey === key) {
+        setIntradaySortDir((d) => (d === 'asc' ? 'desc' : 'asc'));
+      } else {
+        setIntradaySortKey(key);
+        setIntradaySortDir(
+          key === 'rank' || key === 'targetTimeframe' || key === 'targetSlot' ? 'asc' : 'desc'
+        );
+      }
+    };
+
+    const renderIntradaySortIcon = (key: IntradayMatchSortKey) => {
+      if (intradaySortKey !== key) {
+        return <ArrowUpDown className="h-3 w-3 text-slate-600" aria-hidden="true" />;
+      }
+      return intradaySortDir === 'asc' ? (
+        <ArrowUp className="h-3 w-3 text-amber-400" aria-hidden="true" />
+      ) : (
+        <ArrowDown className="h-3 w-3 text-amber-400" aria-hidden="true" />
+      );
+    };
+
+    const handleMatrixSort = (key: IntradayMatrixSortKey) => {
+      if (matrixSortKey === key) {
+        setMatrixSortDir((d) => (d === 'asc' ? 'desc' : 'asc'));
+      } else {
+        setMatrixSortKey(key);
+        setMatrixSortDir(key === 'anchorSlot' ? 'asc' : 'desc');
+      }
+      setMatrixPage(1);
+    };
+
+    const renderMatrixSortIcon = (key: IntradayMatrixSortKey) => {
+      if (matrixSortKey !== key) {
+        return <ArrowUpDown className="h-3 w-3 text-slate-600" aria-hidden="true" />;
+      }
+      return matrixSortDir === 'asc' ? (
+        <ArrowUp className="h-3 w-3 text-amber-400" aria-hidden="true" />
+      ) : (
+        <ArrowDown className="h-3 w-3 text-amber-400" aria-hidden="true" />
+      );
+    };
+
+    const totalMatrixPages = Math.max(1, Math.ceil(displayedMatrixRows.length / matrixPageSize));
+    const safeMatrixPage = Math.min(matrixPage, totalMatrixPages);
+    const pageMatrixRows = displayedMatrixRows.slice(
+      (safeMatrixPage - 1) * matrixPageSize,
+      safeMatrixPage * matrixPageSize
+    );
+
+    return (
+      <div className="space-y-6">
+        {/* Header & Exports */}
+        <div className="flex flex-col justify-between gap-4 border-b border-[#1E293B] pb-6 lg:flex-row lg:items-end">
+          <div className="space-y-1.5">
+            <p className="text-xs font-medium text-amber-400">
+              Step 4 of 4 ·{' '}
+              {isSingleAnchor
+                ? 'Daily Intraday Time-Slot Direction Match'
+                : 'Full-Matrix Intraday Time-Slot Collection'}
+            </p>
+            <h1 className="text-2xl font-bold tracking-tight text-slate-50 sm:text-3xl">
+              {isSingleAnchor
+                ? `Anchor ${intradayResult.anchorTimeframe} (${intradayResult.anchorSlotKey} UTC) Recurring Slot Matches`
+                : `Master Intraday Slot Correlation Matrix (${intradayResult.anchorTimeframe})`}
+            </h1>
+            <p className="text-xs text-slate-400">
+              <span>
+                Targets: {intradayResult.targetTimeframes.join(', ')}
+              </span>
+              <span aria-hidden="true" className="mx-2 text-slate-600">·</span>
+              <span>
+                Filter:{' '}
+                {intradayResult.config.directionFilter === 'any_non_doji'
+                  ? 'Bullish & Bearish'
+                  : intradayResult.config.directionFilter === 'bullish_only'
+                    ? 'Bullish Anchor Only'
+                    : 'Bearish Anchor Only'}
+              </span>
+              <span aria-hidden="true" className="mx-2 text-slate-600">·</span>
+              <span className="font-mono tabular-nums">
+                Computed in {intradayResult.computeDurationMs.toFixed(1)} ms
+              </span>
+              {intradayResult.usedWorker && (
+                <>
+                  <span aria-hidden="true" className="mx-2 text-slate-600">·</span>
+                  <span>Off-Thread Worker</span>
+                </>
+              )}
+            </p>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2.5">
+            <button
+              type="button"
+              onClick={onBackToConfigure}
+              className="inline-flex h-10 items-center gap-2 whitespace-nowrap rounded border border-[#1E293B] bg-[#111824] px-3.5 text-xs font-medium text-slate-200 transition-colors hover:border-slate-600 hover:bg-[#162032]"
+            >
+              <SlidersHorizontal className="h-3.5 w-3.5 text-slate-400" aria-hidden="true" />
+              <span>Modify Search</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={() =>
+                isSingleAnchor
+                  ? downloadIntradaySlotMatchesCsv(intradayResult, filteredIntradayMatches)
+                  : downloadIntradayMatrixCsv(intradayResult, displayedMatrixRows)
+              }
+              disabled={
+                isSingleAnchor
+                  ? filteredIntradayMatches.length === 0
+                  : displayedMatrixRows.length === 0
+              }
+              className="inline-flex h-10 items-center gap-2 whitespace-nowrap rounded border border-[#2A3950] bg-[#111824] px-3.5 text-xs font-medium text-slate-100 transition-colors hover:border-amber-500/60 hover:text-amber-300 disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              <Download className="h-3.5 w-3.5" aria-hidden="true" />
+              <span>{isSingleAnchor ? 'Export Matches CSV' : 'Export Matrix CSV'}</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={() =>
+                exportIntradaySlotReportPdf(
+                  intradayResult,
+                  filteredIntradayMatches,
+                  displayedMatrixRows,
+                  intradayFilters
+                )
+              }
+              className="inline-flex h-10 items-center gap-2 whitespace-nowrap rounded bg-amber-500 px-4 text-xs font-semibold text-slate-950 transition-colors hover:bg-amber-400 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-amber-400"
+            >
+              <FileDown className="h-3.5 w-3.5" aria-hidden="true" />
+              <span>Download PDF Report</span>
+            </button>
+          </div>
+        </div>
+
+        {/* Warning Banner */}
+        {intradayResult.warningMessage && (
+          <div
+            role="alert"
+            className="flex items-start gap-3 rounded border border-amber-500/40 bg-amber-500/10 p-4 text-xs text-amber-200"
+          >
+            <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-400" aria-hidden="true" />
+            <p className="leading-relaxed">{intradayResult.warningMessage}</p>
+          </div>
+        )}
+
+        {/* 5 KPI Summary Cards */}
+        <section
+          aria-label="Intraday time-slot correlation summary KPIs"
+          className="grid grid-cols-2 divide-y divide-[#1E293B] rounded border border-[#1E293B] bg-[#111824] md:grid-cols-3 lg:grid-cols-5 lg:divide-x lg:divide-y-0"
+        >
+          <div className="p-4">
+            <p className="text-[11px] text-slate-400">
+              {isSingleAnchor ? 'Anchor Time Slot' : 'Anchor Timeframe'}
+            </p>
+            <p className="mt-1 truncate font-mono text-sm font-semibold text-slate-100">
+              {isSingleAnchor
+                ? `${intradayResult.anchorTimeframe} · ${intradayResult.anchorSlotKey} UTC`
+                : `${intradayResult.anchorTimeframe} · All Slots`}
+            </p>
+            <p className="mt-0.5 font-mono text-[11px] tabular-nums text-slate-500">
+              {isSingleAnchor
+                ? `Exclude Self: ${intradayResult.config.excludeSelfSlot ? 'Yes' : 'No'}`
+                : `${intradayResult.totalAnchorSlotsEvaluated.toLocaleString()} slots evaluated`}
+            </p>
+          </div>
+
+          <div className="p-4">
+            <p className="text-[11px] text-slate-400">Valid UTC Days Evaluated</p>
+            <p className="mt-1 font-mono text-sm font-semibold tabular-nums text-slate-100">
+              {intradayResult.totalValidDaysEvaluated.toLocaleString()}
+            </p>
+            <p className="mt-0.5 truncate font-mono text-[11px] tabular-nums text-slate-500">
+              {intradayResult.effectiveStartUtc ?? '—'} → {intradayResult.effectiveEndUtc ?? '—'}
+            </p>
+          </div>
+
+          <div className="p-4">
+            <p className="text-[11px] text-slate-400">
+              {isSingleAnchor ? '#1 Best Matched Slot' : 'Strongest Anchor → Target'}
+            </p>
+            <p className="mt-1 truncate font-mono text-sm font-semibold text-emerald-400">
+              {isSingleAnchor
+                ? topSingle
+                  ? `${topSingle.targetTimeframe} · ${topSingle.targetSlotKey} UTC`
+                  : '—'
+                : strongestMatrixRow?.bestTarget
+                  ? `${strongestMatrixRow.anchorSlotKey} → ${strongestMatrixRow.bestTarget.targetTimeframe} ${strongestMatrixRow.bestTarget.targetSlotKey}`
+                  : '—'}
+            </p>
+            <p className="mt-0.5 font-mono text-[11px] tabular-nums text-slate-500">
+              {isSingleAnchor
+                ? topSingle
+                  ? `${topSingle.matchedDays} / ${topSingle.totalCoOccurringDays} same-day matches`
+                  : 'No qualifying target'
+                : strongestMatrixRow?.bestTarget
+                  ? `${strongestMatrixRow.bestTarget.matchedDays} / ${strongestMatrixRow.bestTarget.totalCoOccurringDays} days`
+                  : 'No qualifying pair'}
+            </p>
+          </div>
+
+          <div className="p-4">
+            <p className="text-[11px] text-slate-400">
+              {isSingleAnchor ? 'Highest Match Rate (%)' : 'Peak Match Rate (%)'}
+            </p>
+            <p className="mt-1 font-mono text-sm font-semibold tabular-nums text-emerald-400">
+              {isSingleAnchor
+                ? topSingle
+                  ? `${topSingle.matchRatePct.toFixed(2)}%`
+                  : '—'
+                : strongestMatrixRow?.bestTarget
+                  ? `${strongestMatrixRow.bestTarget.matchRatePct.toFixed(2)}%`
+                  : '—'}
+            </p>
+            <p className="mt-0.5 font-mono text-[11px] tabular-nums text-slate-500">
+              Min ≥{intradayResult.config.minMatchRatePct}% · Min N=
+              {intradayResult.config.minCoOccurringDays}
+            </p>
+          </div>
+
+          <div className="col-span-2 p-4 md:col-span-1">
+            <p className="text-[11px] text-slate-400">
+              {isSingleAnchor ? 'Qualifying Slots Found' : 'Pairwise Slot Evaluations'}
+            </p>
+            <p className="mt-1 font-mono text-sm font-semibold tabular-nums text-slate-100">
+              {isSingleAnchor
+                ? filteredIntradayMatches.length.toLocaleString()
+                : intradayResult.totalPairwiseEvaluations.toLocaleString()}
+            </p>
+            <p className="mt-0.5 font-mono text-[11px] tabular-nums text-slate-500">
+              {isSingleAnchor
+                ? `of ${intradayResult.totalPairwiseEvaluations.toLocaleString()} candidate slots`
+                : `Showing ${displayedMatrixRows.length.toLocaleString()} anchor slots`}
+            </p>
+          </div>
+        </section>
+
+        {/* Interactive Filter Toolbar */}
+        <section
+          aria-label="Intraday slot filters"
+          className="flex flex-wrap items-center justify-between gap-4 rounded border border-[#1E293B] bg-[#111824] p-4"
+        >
+          <div className="flex flex-wrap items-center gap-3">
+            <div className="relative w-60">
+              <Search
+                className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-slate-500"
+                aria-hidden="true"
+              />
+              <input
+                type="text"
+                value={intradayFilters.searchQuery}
+                onChange={(e) => {
+                  onChangeIntradayFilters({
+                    ...intradayFilters,
+                    searchQuery: e.target.value,
+                  });
+                  setMatrixPage(1);
+                }}
+                placeholder={
+                  isSingleAnchor
+                    ? 'Search target slot e.g. 14:30, 1H...'
+                    : 'Search anchor or target slot...'
+                }
+                aria-label="Search intraday time slots"
+                className="h-9 w-full rounded border border-[#2A3950] bg-[#0B0F17] pl-8 pr-3 text-xs text-slate-100 placeholder:text-slate-600 focus:border-amber-500 focus:outline-none"
+              />
+            </div>
+
+            {intradayResult.targetTimeframes.length > 1 && (
+              <select
+                aria-label="Filter by target timeframe"
+                value={intradayFilters.targetTimeframeFilter}
+                onChange={(e) => {
+                  onChangeIntradayFilters({
+                    ...intradayFilters,
+                    targetTimeframeFilter: e.target.value as TimeframeId | 'ALL',
+                  });
+                  setMatrixPage(1);
+                }}
+                className="h-9 rounded border border-[#2A3950] bg-[#0B0F17] px-2.5 font-mono text-xs text-slate-100 focus:border-amber-500 focus:outline-none"
+              >
+                <option value="ALL">All Target TFs ({intradayResult.targetTimeframes.length})</option>
+                {intradayResult.targetTimeframes.map((tf) => (
+                  <option key={tf} value={tf}>
+                    Target: {tf}
+                  </option>
+                ))}
+              </select>
+            )}
+
+            <div className="flex items-center gap-1 rounded border border-[#1E293B] bg-[#0B0F17] p-0.5">
+              {(
+                [
+                  { id: 'all', label: 'All Bias' },
+                  { id: 'bullish_dominant', label: 'Bullish Dominant' },
+                  { id: 'bearish_dominant', label: 'Bearish Dominant' },
+                ] as { id: IntradaySlotFilterState['directionBiasFilter']; label: string }[]
+              ).map((tab) => (
+                <button
+                  key={tab.id}
+                  type="button"
+                  onClick={() => {
+                    onChangeIntradayFilters({
+                      ...intradayFilters,
+                      directionBiasFilter: tab.id,
+                    });
+                    setMatrixPage(1);
+                  }}
+                  className={`whitespace-nowrap rounded px-2.5 py-1 text-xs font-medium transition-colors ${
+                    intradayFilters.directionBiasFilter === tab.id
+                      ? 'bg-[#1E293B] text-amber-400'
+                      : 'text-slate-400 hover:text-slate-200'
+                  }`}
+                >
+                  {tab.label}
+                </button>
+              ))}
+            </div>
+
+            <div className="flex items-center gap-2 text-xs">
+              <label htmlFor="intraday-min-rate" className="text-slate-400">
+                Rate Floor:
+              </label>
+              <input
+                id="intraday-min-rate"
+                type="number"
+                min={0}
+                max={100}
+                value={intradayFilters.minRateOverride}
+                onChange={(e) => {
+                  onChangeIntradayFilters({
+                    ...intradayFilters,
+                    minRateOverride: Math.max(0, Math.min(100, Number(e.target.value) || 0)),
+                  });
+                  setMatrixPage(1);
+                }}
+                className="h-9 w-16 rounded border border-[#2A3950] bg-[#0B0F17] px-2 font-mono text-xs tabular-nums text-slate-100 focus:border-amber-500 focus:outline-none"
+              />
+              <span className="font-mono text-slate-500">%</span>
+            </div>
+          </div>
+
+          <div className="flex items-center gap-3">
+            <span className="font-mono text-xs tabular-nums text-slate-400">
+              {isSingleAnchor
+                ? `Showing ${filteredIntradayMatches.length} of ${intradayResult.matches.length}`
+                : `Showing ${displayedMatrixRows.length} of ${intradayResult.matrixSummaries.length}`}
+            </span>
+            <button
+              type="button"
+              onClick={handleResetIntradayFilters}
+              className="inline-flex items-center gap-1.5 text-xs font-medium text-slate-400 transition-colors hover:text-amber-400"
+            >
+              <RotateCcw className="h-3.5 w-3.5" aria-hidden="true" />
+              <span>Reset</span>
+            </button>
+          </div>
+        </section>
+
+        {/* SINGLE-ANCHOR RANKED TABLE */}
+        {isSingleAnchor ? (
+          <section aria-label="Ranked intraday slot matches table" className="space-y-3">
+            <div className="flex flex-wrap items-baseline justify-between gap-2">
+              <h2 className="text-base font-semibold text-slate-100">
+                Ranked Intraday Time-Slot Matches
+              </h2>
+              <p className="text-xs text-slate-400">
+                Click any row to inspect every exact UTC calendar day (YYYY-MM-DD), OHLC values,
+                and side-by-side anchor vs. target candlesticks.
+              </p>
+            </div>
+
+            <div className="overflow-hidden rounded border border-[#1E293B] bg-[#111824]">
+              <div className="overflow-x-auto">
+                <table className="w-full border-collapse text-left text-xs">
+                  <thead>
+                    <tr className="border-b border-[#1E293B] bg-[#0D131E] text-slate-400">
+                      <th className="px-4 py-3 font-medium">
+                        <button
+                          type="button"
+                          onClick={() => handleIntradaySort('rank')}
+                          className="inline-flex items-center gap-1 hover:text-slate-100"
+                        >
+                          <span>Rank</span>
+                          {renderIntradaySortIcon('rank')}
+                        </button>
+                      </th>
+                      <th className="px-4 py-3 font-medium">
+                        <button
+                          type="button"
+                          onClick={() => handleIntradaySort('targetTimeframe')}
+                          className="inline-flex items-center gap-1 hover:text-slate-100"
+                        >
+                          <span>Target TF</span>
+                          {renderIntradaySortIcon('targetTimeframe')}
+                        </button>
+                      </th>
+                      <th className="px-4 py-3 font-medium">
+                        <button
+                          type="button"
+                          onClick={() => handleIntradaySort('targetSlot')}
+                          className="inline-flex items-center gap-1 hover:text-slate-100"
+                        >
+                          <span>Target Slot (UTC)</span>
+                          {renderIntradaySortIcon('targetSlot')}
+                        </button>
+                      </th>
+                      <th className="px-4 py-3 text-right font-medium">
+                        <button
+                          type="button"
+                          onClick={() => handleIntradaySort('matchedDays')}
+                          className="inline-flex items-center justify-end gap-1 hover:text-slate-100"
+                        >
+                          <span>Matched / Total Days</span>
+                          {renderIntradaySortIcon('matchedDays')}
+                        </button>
+                      </th>
+                      <th className="px-4 py-3 text-right font-medium">
+                        <button
+                          type="button"
+                          onClick={() => handleIntradaySort('matchRatePct')}
+                          className="inline-flex items-center justify-end gap-1 hover:text-slate-100"
+                        >
+                          <span>Match Rate (%)</span>
+                          {renderIntradaySortIcon('matchRatePct')}
+                        </button>
+                      </th>
+                      <th className="px-4 py-3 text-right font-medium">
+                        <button
+                          type="button"
+                          onClick={() => handleIntradaySort('bullishMatches')}
+                          className="inline-flex items-center justify-end gap-1 hover:text-slate-100"
+                        >
+                          <span>Bullish Matches</span>
+                          {renderIntradaySortIcon('bullishMatches')}
+                        </button>
+                      </th>
+                      <th className="px-4 py-3 text-right font-medium">
+                        <button
+                          type="button"
+                          onClick={() => handleIntradaySort('bearishMatches')}
+                          className="inline-flex items-center justify-end gap-1 hover:text-slate-100"
+                        >
+                          <span>Bearish Matches</span>
+                          {renderIntradaySortIcon('bearishMatches')}
+                        </button>
+                      </th>
+                      <th className="px-4 py-3 font-medium">Directional Split</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-[#1E293B]">
+                    {displayedIntradayMatches.length === 0 ? (
+                      <tr>
+                        <td colSpan={8} className="px-6 py-12 text-center">
+                          <p className="text-sm font-medium text-slate-300">
+                            No intraday target slots met the active match rate threshold
+                          </p>
+                          <p className="mt-1 text-xs text-slate-500">
+                            {intradayResult.matches.length === 0
+                              ? 'Lower Min Match Rate % or Min Co-Occurring Days in Step 3.'
+                              : 'Reset local search or rate floor filters.'}
+                          </p>
+                          <div className="mt-4 flex flex-wrap justify-center gap-2">
+                            {intradayResult.matches.length > 0 && (
+                              <button
+                                type="button"
+                                onClick={handleResetIntradayFilters}
+                                className="inline-flex h-9 items-center gap-1.5 rounded border border-[#2A3950] bg-[#0B0F17] px-3.5 text-xs font-medium text-amber-400 hover:border-amber-500/60"
+                              >
+                                <RotateCcw className="h-3.5 w-3.5" aria-hidden="true" />
+                                <span>Reset Table Filters</span>
+                              </button>
+                            )}
+                            <button
+                              type="button"
+                              onClick={onBackToConfigure}
+                              className="inline-flex h-9 items-center gap-1.5 rounded border border-[#2A3950] bg-[#0B0F17] px-3.5 text-xs font-medium text-slate-200 hover:border-slate-500"
+                            >
+                              <SlidersHorizontal className="h-3.5 w-3.5" aria-hidden="true" />
+                              <span>Modify Search in Step 3</span>
+                            </button>
+                          </div>
+                        </td>
+                      </tr>
+                    ) : (
+                      displayedIntradayMatches.map(({ match: m, rank }) => {
+                        const isHigh = m.matchRatePct >= 80;
+                        const bullShare =
+                          m.matchedDays > 0 ? (m.bullishMatches / m.matchedDays) * 100 : 0;
+                        const bearShare =
+                          m.matchedDays > 0 ? (m.bearishMatches / m.matchedDays) * 100 : 0;
+
+                        return (
+                          <tr
+                            key={m.id}
+                            onClick={() => setSelectedIntradayMatch(m)}
+                            className={`cursor-pointer transition-colors ${
+                              isHigh
+                                ? 'bg-emerald-500/[0.04] hover:bg-emerald-500/[0.09]'
+                                : 'hover:bg-[#162032]'
+                            }`}
+                          >
+                            <td className="px-4 py-3 font-mono tabular-nums text-slate-400">
+                              #{rank}
+                            </td>
+                            <td className="px-4 py-3 font-mono font-medium text-slate-300">
+                              {m.targetTimeframe}
+                            </td>
+                            <td className="whitespace-nowrap px-4 py-3">
+                              <button
+                                type="button"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  setSelectedIntradayMatch(m);
+                                }}
+                                className="font-mono font-semibold text-slate-100 hover:text-amber-300 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-amber-500"
+                              >
+                                {m.targetSlotKey} UTC
+                              </button>
+                            </td>
+                            <td className="px-4 py-3 text-right font-mono tabular-nums text-slate-200">
+                              <span className="font-semibold">{m.matchedDays}</span>
+                              <span className="text-slate-500"> / {m.totalCoOccurringDays}</span>
+                            </td>
+                            <td className="px-4 py-3 text-right font-mono tabular-nums">
+                              <div className="flex flex-col items-end gap-1">
+                                <span
+                                  className={`font-semibold ${
+                                    isHigh
+                                      ? 'text-emerald-400'
+                                      : m.matchRatePct >= 65
+                                        ? 'text-sky-300'
+                                        : 'text-amber-300'
+                                  }`}
+                                >
+                                  {m.matchRatePct.toFixed(2)}%
+                                </span>
+                                <div className="h-1 w-20 overflow-hidden rounded bg-[#0B0F17]">
+                                  <div
+                                    className={
+                                      isHigh
+                                        ? 'h-full bg-emerald-500'
+                                        : m.matchRatePct >= 65
+                                          ? 'h-full bg-sky-400'
+                                          : 'h-full bg-amber-400'
+                                    }
+                                    style={{ width: `${Math.min(100, m.matchRatePct)}%` }}
+                                  />
+                                </div>
+                              </div>
+                            </td>
+                            <td className="px-4 py-3 text-right font-mono tabular-nums text-emerald-400">
+                              {m.bullishMatches.toLocaleString()}
+                            </td>
+                            <td className="px-4 py-3 text-right font-mono tabular-nums text-red-400">
+                              {m.bearishMatches.toLocaleString()}
+                            </td>
+                            <td className="px-4 py-3">
+                              <div className="flex items-center gap-2">
+                                <div
+                                  className="flex h-2 w-24 overflow-hidden rounded-[2px] bg-[#0B0F17]"
+                                  title={`Bullish: ${m.bullishMatches} · Bearish: ${m.bearishMatches}`}
+                                >
+                                  <div
+                                    className="h-full bg-emerald-500"
+                                    style={{ width: `${bullShare}%` }}
+                                  />
+                                  <div
+                                    className="h-full bg-red-500"
+                                    style={{ width: `${bearShare}%` }}
+                                  />
+                                </div>
+                                <span className="font-mono text-[11px] tabular-nums text-slate-400">
+                                  {bullShare.toFixed(0)}B / {bearShare.toFixed(0)}S
+                                </span>
+                              </div>
+                            </td>
+                          </tr>
+                        );
+                      })
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </section>
+        ) : (
+          /* FULL-MATRIX MASTER INTRADAY SLOT LEADERBOARD TABLE */
+          <section aria-label="Master intraday slot matrix table" className="space-y-3">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <h2 className="text-base font-semibold text-slate-100">
+                  Master Intraday Slot Matrix Leaderboard
+                </h2>
+                <p className="text-xs text-slate-400">
+                  Every anchor slot in {intradayResult.anchorTimeframe} paired with its #1 highest
+                  matching target slot. Click any row to inspect its Top 10 correlated slots and
+                  full day-by-day history.
+                </p>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-3 font-mono text-xs tabular-nums text-slate-400">
+                <label className="inline-flex items-center gap-1.5">
+                  <span>Rows/page:</span>
+                  <select
+                    aria-label="Matrix rows per page"
+                    value={matrixPageSize}
+                    onChange={(e) => {
+                      setMatrixPageSize(Number(e.target.value));
+                      setMatrixPage(1);
+                    }}
+                    className="h-8 rounded border border-[#2A3950] bg-[#111824] px-2 text-xs text-slate-100 focus:border-amber-500 focus:outline-none"
+                  >
+                    <option value={50}>50</option>
+                    <option value={100}>100</option>
+                    <option value={250}>250</option>
+                  </select>
+                </label>
+
+                {totalMatrixPages > 1 && (
+                  <div className="flex items-center gap-1.5">
+                    <button
+                      type="button"
+                      disabled={safeMatrixPage <= 1}
+                      onClick={() => setMatrixPage((p) => Math.max(1, p - 1))}
+                      aria-label="Previous matrix page"
+                      className="inline-flex h-8 w-8 items-center justify-center rounded border border-[#1E293B] bg-[#111824] text-slate-300 hover:border-slate-600 disabled:opacity-40"
+                    >
+                      <ChevronLeft className="h-3.5 w-3.5" aria-hidden="true" />
+                    </button>
+                    <span className="px-1">
+                      {safeMatrixPage} / {totalMatrixPages}
+                    </span>
+                    <button
+                      type="button"
+                      disabled={safeMatrixPage >= totalMatrixPages}
+                      onClick={() => setMatrixPage((p) => Math.min(totalMatrixPages, p + 1))}
+                      aria-label="Next matrix page"
+                      className="inline-flex h-8 w-8 items-center justify-center rounded border border-[#1E293B] bg-[#111824] text-slate-300 hover:border-slate-600 disabled:opacity-40"
+                    >
+                      <ChevronRight className="h-3.5 w-3.5" aria-hidden="true" />
+                    </button>
+                  </div>
+                )}
+              </div>
+            </div>
+
+            <div className="overflow-hidden rounded border border-[#1E293B] bg-[#111824]">
+              <div className="overflow-x-auto">
+                <table className="w-full border-collapse text-left text-xs">
+                  <thead>
+                    <tr className="border-b border-[#1E293B] bg-[#0D131E] text-slate-400">
+                      <th className="px-4 py-3 font-medium">
+                        <button
+                          type="button"
+                          onClick={() => handleMatrixSort('anchorSlot')}
+                          className="inline-flex items-center gap-1 hover:text-slate-100"
+                        >
+                          <span>Anchor Slot (UTC)</span>
+                          {renderMatrixSortIcon('anchorSlot')}
+                        </button>
+                      </th>
+                      <th className="px-4 py-3 text-right font-medium">
+                        <button
+                          type="button"
+                          onClick={() => handleMatrixSort('validDays')}
+                          className="inline-flex items-center justify-end gap-1 hover:text-slate-100"
+                        >
+                          <span>Valid Anchor Days</span>
+                          {renderMatrixSortIcon('validDays')}
+                        </button>
+                      </th>
+                      <th className="px-4 py-3 font-medium">
+                        <button
+                          type="button"
+                          onClick={() => handleMatrixSort('bestTarget')}
+                          className="inline-flex items-center gap-1 hover:text-slate-100"
+                        >
+                          <span>#1 Best Matched Target</span>
+                          {renderMatrixSortIcon('bestTarget')}
+                        </button>
+                      </th>
+                      <th className="px-4 py-3 text-right font-medium">
+                        <button
+                          type="button"
+                          onClick={() => handleMatrixSort('matchedDays')}
+                          className="inline-flex items-center justify-end gap-1 hover:text-slate-100"
+                        >
+                          <span>Matched / Total</span>
+                          {renderMatrixSortIcon('matchedDays')}
+                        </button>
+                      </th>
+                      <th className="px-4 py-3 text-right font-medium">
+                        <button
+                          type="button"
+                          onClick={() => handleMatrixSort('matchRatePct')}
+                          className="inline-flex items-center justify-end gap-1 hover:text-slate-100"
+                        >
+                          <span>Match Rate (%)</span>
+                          {renderMatrixSortIcon('matchRatePct')}
+                        </button>
+                      </th>
+                      <th className="px-4 py-3 text-right font-medium">
+                        <button
+                          type="button"
+                          onClick={() => handleMatrixSort('top5Avg')}
+                          className="inline-flex items-center justify-end gap-1 hover:text-slate-100"
+                        >
+                          <span>Top-5 Avg %</span>
+                          {renderMatrixSortIcon('top5Avg')}
+                        </button>
+                      </th>
+                      <th className="px-4 py-3 font-medium">Best Pair Bull / Bear</th>
+                      <th className="px-4 py-3 font-medium">Top 3 Correlated</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-[#1E293B]">
+                    {pageMatrixRows.length === 0 ? (
+                      <tr>
+                        <td colSpan={8} className="px-6 py-12 text-center">
+                          <p className="text-sm font-medium text-slate-300">
+                            No anchor slots matched your current filter settings
+                          </p>
+                          <p className="mt-1 text-xs text-slate-500">
+                            Reset dashboard filters or adjust Step 3 thresholds.
+                          </p>
+                        </td>
+                      </tr>
+                    ) : (
+                      pageMatrixRows.map((row) => {
+                        const best = row.bestTarget;
+                        const isHigh = Boolean(best && best.matchRatePct >= 80);
+
+                        return (
+                          <tr
+                            key={row.id}
+                            onClick={() => setSelectedMatrixRow(row)}
+                            className={`cursor-pointer transition-colors ${
+                              isHigh
+                                ? 'bg-emerald-500/[0.04] hover:bg-emerald-500/[0.09]'
+                                : 'hover:bg-[#162032]'
+                            }`}
+                          >
+                            <td className="whitespace-nowrap px-4 py-2.5">
+                              <button
+                                type="button"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  setSelectedMatrixRow(row);
+                                }}
+                                className="font-mono font-semibold text-slate-100 hover:text-amber-300 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-amber-500"
+                              >
+                                {row.anchorTimeframe} · {row.anchorSlotKey} UTC
+                              </button>
+                            </td>
+                            <td className="whitespace-nowrap px-4 py-2.5 text-right font-mono tabular-nums text-slate-300">
+                              <span className="font-medium text-slate-100">
+                                {row.totalValidAnchorDays.toLocaleString()}
+                              </span>
+                              <span className="ml-1.5 text-[11px] text-slate-500">
+                                ({row.bullishAnchorDays}B / {row.bearishAnchorDays}S)
+                              </span>
+                            </td>
+                            <td className="whitespace-nowrap px-4 py-2.5 font-mono font-medium text-amber-300">
+                              {best
+                                ? `${best.targetTimeframe} · ${best.targetSlotKey} UTC`
+                                : 'No qualifying target'}
+                            </td>
+                            <td className="whitespace-nowrap px-4 py-2.5 text-right font-mono tabular-nums text-slate-200">
+                              {best ? (
+                                <>
+                                  <span className="font-semibold">{best.matchedDays}</span>
+                                  <span className="text-slate-500">
+                                    {' '}
+                                    / {best.totalCoOccurringDays}
+                                  </span>
+                                </>
+                              ) : (
+                                <span className="text-slate-500">—</span>
+                              )}
+                            </td>
+                            <td className="px-4 py-2.5 text-right font-mono tabular-nums">
+                              {best ? (
+                                <div className="flex flex-col items-end gap-1">
+                                  <span
+                                    className={`font-semibold ${
+                                      isHigh
+                                        ? 'text-emerald-400'
+                                        : best.matchRatePct >= 65
+                                          ? 'text-sky-300'
+                                          : 'text-amber-300'
+                                    }`}
+                                  >
+                                    {best.matchRatePct.toFixed(2)}%
+                                  </span>
+                                  <div className="h-1 w-16 overflow-hidden rounded bg-[#0B0F17]">
+                                    <div
+                                      className={
+                                        isHigh
+                                          ? 'h-full bg-emerald-500'
+                                          : best.matchRatePct >= 65
+                                            ? 'h-full bg-sky-400'
+                                            : 'h-full bg-amber-400'
+                                      }
+                                      style={{ width: `${Math.min(100, best.matchRatePct)}%` }}
+                                    />
+                                  </div>
+                                </div>
+                              ) : (
+                                <span className="text-slate-500">0.00%</span>
+                              )}
+                            </td>
+                            <td className="whitespace-nowrap px-4 py-2.5 text-right font-mono tabular-nums text-sky-300">
+                              {row.topTargets.length > 0
+                                ? `${row.top5AvgMatchRatePct.toFixed(1)}%`
+                                : '—'}
+                            </td>
+                            <td className="whitespace-nowrap px-4 py-2.5 font-mono tabular-nums">
+                              {best ? (
+                                <>
+                                  <span className="text-emerald-400">{best.bullishMatches}B</span>
+                                  <span className="mx-1 text-slate-600">/</span>
+                                  <span className="text-red-400">{best.bearishMatches}S</span>
+                                </>
+                              ) : (
+                                <span className="text-slate-500">—</span>
+                              )}
+                            </td>
+                            <td className="px-4 py-2.5 font-mono text-[11px] text-slate-400">
+                              {row.topTargets.length > 0
+                                ? row.topTargets
+                                    .slice(0, 3)
+                                    .map(
+                                      (t) =>
+                                        `${t.targetTimeframe} ${t.targetSlotKey} (${t.matchRatePct.toFixed(0)}%)`
+                                    )
+                                    .join(' · ')
+                                : '—'}
+                            </td>
+                          </tr>
+                        );
+                      })
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </section>
+        )}
+
+        {/* Intraday Slot Day-by-Day Drill-Down Drawer */}
+        <DrillDownDrawer
+          intradayMatch={selectedIntradayMatch}
+          intradayMatrixRow={selectedMatrixRow}
+          intradayConfig={intradayResult.config}
+          datasets={datasets}
+          onClose={() => {
+            setSelectedIntradayMatch(null);
+            setSelectedMatrixRow(null);
+          }}
+        />
+      </div>
+    );
+  }
+
+  // =========================================================================
+  // VIEW 1B: BEST MATCHED CANDLES DASHBOARD (GEOMETRIC / MULTI-TF)
   // =========================================================================
   if (engineMode === 'best_matches' && bestMatchResult) {
     const topMatch = filteredMatches[0] ?? null;

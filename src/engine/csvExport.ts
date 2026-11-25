@@ -5,6 +5,9 @@ import {
   BestMatchResult,
   CollectedCandleSlot,
   CollectorResult,
+  IntradayFullMatrixAnchorSummary,
+  IntradaySlotMatchItem,
+  IntradaySlotMatchResult,
   PrincipalCandidateResult,
   TimeframeDataset,
 } from './types';
@@ -250,5 +253,125 @@ export function downloadBestMatchesCsv(
     'text/csv;charset=utf-8;'
   );
 }
+
+/**
+ * Exports Single-Anchor Ranked Intraday Slot Direction Matches as CSV (including sample matched dates).
+ */
+export function downloadIntradaySlotMatchesCsv(
+  result: IntradaySlotMatchResult,
+  filteredMatches: IntradaySlotMatchItem[]
+): void {
+  const headers = [
+    'Rank',
+    'Anchor_Timeframe',
+    'Anchor_Slot_UTC',
+    'Target_Timeframe',
+    'Target_Slot_UTC',
+    'Matched_Days',
+    'Total_CoOccurring_Days',
+    'Match_Rate_Pct',
+    'Bullish_Matches',
+    'Bearish_Matches',
+    'Sample_Matched_Dates',
+  ];
+
+  const rows: string[] = [headers.join(',')];
+
+  filteredMatches.forEach((m, idx) => {
+    const sampleDates = m.dayRecords
+      .filter((r) => r.isMatch)
+      .slice(0, 20)
+      .map((r) => `${r.dateStr}(${r.matchDirection})`)
+      .join(' | ');
+
+    rows.push(
+      [
+        idx + 1,
+        m.anchorTimeframe,
+        m.anchorSlotKey,
+        m.targetTimeframe,
+        m.targetSlotKey,
+        m.matchedDays,
+        m.totalCoOccurringDays,
+        m.matchRatePct.toFixed(2),
+        m.bullishMatches,
+        m.bearishMatches,
+        escapeCsvCell(sampleDates),
+      ].join(',')
+    );
+  });
+
+  const slotSlug = (result.anchorSlotKey || 'slot').replace(/:/g, '');
+  triggerDownload(
+    rows.join('\n'),
+    `btc_intraday_match_${result.anchorTimeframe.toLowerCase()}_${slotSlug}.csv`,
+    'text/csv;charset=utf-8;'
+  );
+}
+
+/**
+ * Exports Full-Matrix All Intraday Slots summary leaderboard as CSV.
+ */
+export function downloadIntradayMatrixCsv(
+  result: IntradaySlotMatchResult,
+  filteredSummaries: IntradayFullMatrixAnchorSummary[]
+): void {
+  const headers = [
+    'Anchor_Timeframe',
+    'Anchor_Slot_UTC',
+    'Valid_Anchor_Days',
+    'Bullish_Anchor_Days',
+    'Bearish_Anchor_Days',
+    'Best_Target_Timeframe',
+    'Best_Target_Slot_UTC',
+    'Best_Matched_Days',
+    'Best_Total_Days',
+    'Best_Match_Rate_Pct',
+    'Best_Bullish_Matches',
+    'Best_Bearish_Matches',
+    'Top_5_Avg_Match_Rate_Pct',
+    'Top_5_Correlated_Slots',
+  ];
+
+  const rows: string[] = [headers.join(',')];
+
+  for (let i = 0; i < filteredSummaries.length; i++) {
+    const row = filteredSummaries[i];
+    const best = row.bestTarget;
+    const top5Str = row.topTargets
+      .slice(0, 5)
+      .map(
+        (t) =>
+          `${t.targetTimeframe} ${t.targetSlotKey} (${t.matchRatePct.toFixed(1)}%, ${t.matchedDays}/${t.totalCoOccurringDays})`
+      )
+      .join(' | ');
+
+    rows.push(
+      [
+        row.anchorTimeframe,
+        row.anchorSlotKey,
+        row.totalValidAnchorDays,
+        row.bullishAnchorDays,
+        row.bearishAnchorDays,
+        best ? best.targetTimeframe : 'N/A',
+        best ? best.targetSlotKey : 'N/A',
+        best ? best.matchedDays : 0,
+        best ? best.totalCoOccurringDays : 0,
+        best ? best.matchRatePct.toFixed(2) : '0.00',
+        best ? best.bullishMatches : 0,
+        best ? best.bearishMatches : 0,
+        row.top5AvgMatchRatePct.toFixed(2),
+        escapeCsvCell(top5Str),
+      ].join(',')
+    );
+  }
+
+  triggerDownload(
+    rows.join('\n'),
+    `btc_intraday_full_matrix_${result.anchorTimeframe.toLowerCase()}.csv`,
+    'text/csv;charset=utf-8;'
+  );
+}
+
 
 

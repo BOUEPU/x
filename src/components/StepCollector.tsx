@@ -12,6 +12,7 @@ import {
   Layers,
   RotateCcw,
   Search,
+  Sparkles,
 } from 'lucide-react';
 import {
   collectCandleDataAsync,
@@ -39,6 +40,7 @@ interface StepCollectorProps {
   onChangeConfig: (next: CollectorConfig) => void;
   onResultReady: (res: CollectorResult) => void;
   onUseAsTargetCandle: (slot: CollectedCandleSlot) => void;
+  onOpenInBestMatch?: (slot: CollectedCandleSlot) => void;
 }
 
 type SortKey =
@@ -62,6 +64,7 @@ export function StepCollector({
   onChangeConfig,
   onResultReady,
   onUseAsTargetCandle,
+  onOpenInBestMatch,
 }: StepCollectorProps) {
   const [searchQuery, setSearchQuery] = useState('');
   const [sortKey, setSortKey] = useState<SortKey>('slot');
@@ -1026,18 +1029,34 @@ export function StepCollector({
                           <span className="text-red-400">{s.longestBearishStreak}</span>
                         </td>
                         <td className="whitespace-nowrap px-3.5 py-2.5 text-right">
-                          <button
-                            type="button"
-                            aria-label={`Use ${s.displayLabel} as Target Candle`}
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              onUseAsTargetCandle(s);
-                            }}
-                            className="inline-flex items-center gap-1 whitespace-nowrap rounded border border-[#2A3950] bg-[#0B0F17] px-2.5 py-1 text-[11px] font-medium text-slate-200 transition-colors hover:border-amber-500/70 hover:text-amber-300"
-                          >
-                            <Crosshair className="h-3 w-3 text-amber-400" aria-hidden="true" />
-                            <span>Use as Target Candle</span>
-                          </button>
+                          <div className="inline-flex items-center justify-end gap-1.5">
+                            {onOpenInBestMatch && (
+                              <button
+                                type="button"
+                                aria-label={`Open ${s.displayLabel} in Best Match`}
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  onOpenInBestMatch(s);
+                                }}
+                                className="inline-flex items-center gap-1 whitespace-nowrap rounded border border-amber-500/40 bg-amber-500/10 px-2.5 py-1 text-[11px] font-medium text-amber-300 transition-colors hover:border-amber-500/80 hover:bg-amber-500/20"
+                              >
+                                <Sparkles className="h-3 w-3" aria-hidden="true" />
+                                <span>Best Match</span>
+                              </button>
+                            )}
+                            <button
+                              type="button"
+                              aria-label={`Use ${s.displayLabel} as Target Candle`}
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                onUseAsTargetCandle(s);
+                              }}
+                              className="inline-flex items-center gap-1 whitespace-nowrap rounded border border-[#2A3950] bg-[#0B0F17] px-2.5 py-1 text-[11px] font-medium text-slate-200 transition-colors hover:border-amber-500/70 hover:text-amber-300"
+                            >
+                              <Crosshair className="h-3 w-3 text-amber-400" aria-hidden="true" />
+                              <span>Use as Target</span>
+                            </button>
+                          </div>
                         </td>
                       </tr>
                     );
@@ -1058,6 +1077,14 @@ export function StepCollector({
           setSelectedSlot(null);
           onUseAsTargetCandle(slot);
         }}
+        onOpenInBestMatch={
+          onOpenInBestMatch
+            ? (slot) => {
+                setSelectedSlot(null);
+                onOpenInBestMatch(slot);
+              }
+            : undefined
+        }
       />
     </div>
   );

@@ -368,4 +368,93 @@ export interface BestMatchFilterState {
   minScoreOverride: number;
 }
 
+// ============================================================================
+// Intraday Time-Slot Direction Correlation & Full-Matrix Collector Types
+// ============================================================================
+
+export type BestMatchEngineSubMode = 'intraday_slot' | 'geometric_pattern';
+
+export type IntradaySlotScopeMode = 'single_anchor' | 'full_matrix';
+
+export type IntradayDirectionFilter = 'any_non_doji' | 'bullish_only' | 'bearish_only';
+
+export interface IntradaySlotMatchConfig {
+  scopeMode: IntradaySlotScopeMode;
+  anchorTimeframe: TimeframeId;
+  anchorSlotKey: string;
+  targetTimeframes: TimeframeId[];
+  directionFilter: IntradayDirectionFilter;
+  excludeSelfSlot: boolean;
+  minCoOccurringDays: number;
+  minMatchRatePct: number;
+  maxResults: MaxResultsLimit;
+  startDateUtc: string;
+  endDateUtc: string;
+}
+
+export interface IntradayDayRecord {
+  dateStr: string;
+  anchorCandle: EnrichedCandle;
+  targetCandle: EnrichedCandle;
+  isMatch: boolean;
+  matchDirection: 'BULLISH' | 'BEARISH' | null;
+}
+
+export interface IntradaySlotMatchItem {
+  id: string;
+  rank: number;
+  anchorTimeframe: TimeframeId;
+  anchorSlotKey: string;
+  targetTimeframe: TimeframeId;
+  targetSlotKey: string;
+  targetSlotSortOrder: number;
+  totalCoOccurringDays: number;
+  matchedDays: number;
+  bullishMatches: number;
+  bearishMatches: number;
+  matchRatePct: number;
+  dayRecords: IntradayDayRecord[];
+}
+
+export interface IntradayFullMatrixAnchorSummary {
+  id: string;
+  anchorTimeframe: TimeframeId;
+  anchorSlotKey: string;
+  anchorSlotSortOrder: number;
+  totalValidAnchorDays: number;
+  bullishAnchorDays: number;
+  bearishAnchorDays: number;
+  bestTarget: IntradaySlotMatchItem | null;
+  topTargets: IntradaySlotMatchItem[];
+  top5AvgMatchRatePct: number;
+  overallAvgMatchRatePct: number;
+}
+
+export interface IntradaySlotMatchResult {
+  config: IntradaySlotMatchConfig;
+  scopeMode: IntradaySlotScopeMode;
+  anchorTimeframe: TimeframeId;
+  anchorSlotKey: string | null;
+  targetTimeframes: TimeframeId[];
+  totalValidDaysEvaluated: number;
+  totalAnchorSlotsEvaluated: number;
+  totalPairwiseEvaluations: number;
+  effectiveStartUtc: string | null;
+  effectiveEndUtc: string | null;
+  matches: IntradaySlotMatchItem[];
+  matrixSummaries: IntradayFullMatrixAnchorSummary[];
+  warningMessage: string | null;
+  computedAtUtc: string;
+  computeDurationMs: number;
+  usedWorker: boolean;
+}
+
+export interface IntradaySlotFilterState {
+  searchQuery: string;
+  targetTimeframeFilter: TimeframeId | 'ALL';
+  directionBiasFilter: 'all' | 'bullish_dominant' | 'bearish_dominant';
+  minRateOverride: number;
+}
+
+
 

@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import { ChevronLeft, ChevronRight, Crosshair, Download, X } from 'lucide-react';
+import { ChevronLeft, ChevronRight, Crosshair, Download, Sparkles, X } from 'lucide-react';
 import { downloadSingleSlotHistoryCsv } from '../engine/csvExport';
 import { formatDecimal } from '../engine/csvParser';
 import { CandleType, CollectedCandleSlot } from '../engine/types';
@@ -9,6 +9,7 @@ interface SlotHistoryModalProps {
   excludeDojiFromPct: boolean;
   onClose: () => void;
   onUseAsTarget: (slot: CollectedCandleSlot) => void;
+  onOpenInBestMatch?: (slot: CollectedCandleSlot) => void;
 }
 
 type TypeFilter = 'ALL' | CandleType;
@@ -20,6 +21,7 @@ export function SlotHistoryModal({
   excludeDojiFromPct,
   onClose,
   onUseAsTarget,
+  onOpenInBestMatch,
 }: SlotHistoryModalProps) {
   const [typeFilter, setTypeFilter] = useState<TypeFilter>('ALL');
   const [page, setPage] = useState(1);
@@ -93,6 +95,17 @@ export function SlotHistoryModal({
           </div>
 
           <div className="flex flex-wrap items-center gap-2">
+            {onOpenInBestMatch && (
+              <button
+                type="button"
+                onClick={() => onOpenInBestMatch(slot)}
+                className="inline-flex h-9 items-center gap-1.5 whitespace-nowrap rounded border border-amber-500/60 bg-amber-500/15 px-3.5 text-xs font-semibold text-amber-300 transition-colors hover:bg-amber-500/25"
+              >
+                <Sparkles className="h-3.5 w-3.5" aria-hidden="true" />
+                <span>Open in Best Match</span>
+              </button>
+            )}
+
             <button
               type="button"
               onClick={() => onUseAsTarget(slot)}

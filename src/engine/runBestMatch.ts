@@ -1,10 +1,16 @@
-import { runBestMatchedCandlesSearch } from './correlation';
-import { WorkerBestMatchRequest, WorkerParseResponse } from './csvWorker';
+import { runBestMatchedCandlesSearch, runIntradaySlotMatchSearch } from './correlation';
+import {
+  WorkerBestMatchRequest,
+  WorkerIntradaySlotRequest,
+  WorkerParseResponse,
+} from './csvWorker';
 import {
   BestMatchConfig,
   BestMatchProgress,
   BestMatchResult,
   EnrichedCandle,
+  IntradaySlotMatchConfig,
+  IntradaySlotMatchResult,
   TimeframeDataset,
   TimeframeId,
 } from './types';
@@ -22,6 +28,21 @@ export function countScannedCandlesForConfig(
     (sum, tf) => sum + (datasets[tf]?.candles.length ?? 0),
     0
   );
+}
+
+export function countScannedCandlesForIntradayConfig(
+  datasets: Partial<Record<TimeframeId, TimeframeDataset>>,
+  config: IntradaySlotMatchConfig
+): number {
+  const uniqueTfs = new Set<TimeframeId>([
+    config.anchorTimeframe,
+    ...config.targetTimeframes,
+  ]);
+  let sum = 0;
+  for (const tf of uniqueTfs) {
+    sum += datasets[tf]?.candles.length ?? 0;
+  }
+  return sum;
 }
 
 /**
@@ -91,6 +112,84 @@ export function executeBestMatchSearchAsync(
     onProgress?.({ percent: 5, scanned: 0, total: totalRows, stage: 'indexing' });
     const req: WorkerBestMatchRequest = {
       type: 'best_match',
+      candlesByTf,
+      config,
+    };
+    worker.postMessage(req);
+  });
+}
+
+/**
+ * Executes Intraday Time-Slot Direction Correlation (Single-Anchor or Full-Matrix).
+ * Automatically routes full-matrix or >50,000 candle evaluations into the Web Worker
+ * with live progress updates.
+ */
+export function executeIntradaySlotMatchAsync(
+  datasets: Partial<Record<TimeframeId, TimeframeDataset>>,
+  config: IntradaySlotMatchConfig,
+  onProgress?: (progress: BestMatchProgress) => void
+): Promise<IntradaySlotMatchResult> {
+  const totalRows = countScannedCandlesForIntradayConfig(datasets, config);
+  const useWorker =
+    typeof Worker !== 'undefined' &&
+    (totalRows > WORKER_ROW_THRESHOLD ||
+      (config.scopeMode === 'full_matrix' && totalRows > 5_000));
+
+  const runDirectAsync = (): Promise<IntradaySlotMatchResult> =>
+    new Promise((resolve) => {
+      onProgress?.({ percent: 10, scanned: 0, total: totalRows, stage: 'indexing' });
+      setTimeout(() => {
+        const res = runIntradaySlotMatchSearch(datasets, config, onProgress, false);
+        resolve(res);
+      }, 15);
+    });
+
+  if (!useWorker) {
+    return runDirectAsync();
+  }
+
+  return new Promise((resolve) => {
+    let worker: Worker;
+    try {
+      worker = new Worker(new URL('./csvWorker.ts', import.meta.url), { type: 'module' });
+    } catch {
+      void runDirectAsync().then(resolve);
+      return;
+    }
+
+    const candlesByTf: Partial<Record<TimeframeId, EnrichedCandle[]>> = {};
+    const needed = new Set<TimeframeId>([
+      config.anchorTimeframe,
+      ...config.targetTimeframes,
+    ]);
+    for (const tf of needed) {
+      const ds = datasets[tf];
+      if (ds && ds.candles.length > 0) {
+        candlesByTf[tf] = ds.candles;
+      }
+    }
+
+    worker.onmessage = (event: MessageEvent<WorkerParseResponse>) => {
+      const msg = event.data;
+      if (msg.type === 'intraday_progress') {
+        onProgress?.(msg.progress);
+      } else if (msg.type === 'intraday_complete') {
+        worker.terminate();
+        resolve(msg.result);
+      } else if (msg.type === 'intraday_error') {
+        worker.terminate();
+        void runDirectAsync().then(resolve);
+      }
+    };
+
+    worker.onerror = () => {
+      worker.terminate();
+      void runDirectAsync().then(resolve);
+    };
+
+    onProgress?.({ percent: 5, scanned: 0, total: totalRows, stage: 'indexing' });
+    const req: WorkerIntradaySlotRequest = {
+      type: 'intraday_slot_match',
       candlesByTf,
       config,
     };

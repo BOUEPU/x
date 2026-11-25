@@ -3,7 +3,9 @@ import {
   AlertTriangle,
   ArrowLeft,
   Check,
+  Clock,
   Crosshair,
+  Grid,
   Layers,
   Play,
   Search,
@@ -17,14 +19,22 @@ import {
 import {
   computeDateOverlap,
   getAvailableSlotsForTimeframe,
+  getIntradayTimeSlotOptions,
   resolveCycleUnit,
 } from '../engine/correlation';
 import { formatUtcDateIso, getCandleEndMs } from '../engine/csvParser';
-import { WORKER_ROW_THRESHOLD, countScannedCandlesForConfig } from '../engine/runBestMatch';
+import {
+  WORKER_ROW_THRESHOLD,
+  countScannedCandlesForConfig,
+  countScannedCandlesForIntradayConfig,
+} from '../engine/runBestMatch';
 import {
   AnalysisConfig,
   BestMatchConfig,
+  BestMatchEngineSubMode,
   BestMatchProgress,
+  IntradayDirectionFilter,
+  IntradaySlotMatchConfig,
   MaxResultsLimit,
   SequenceLength,
   StepEngineMode,
@@ -39,6 +49,8 @@ interface StepConfigureProps {
   datasets: Partial<Record<TimeframeId, TimeframeDataset>>;
   engineMode: StepEngineMode;
   onChangeEngineMode: (mode: StepEngineMode) => void;
+  bestMatchSubMode: BestMatchEngineSubMode;
+  onChangeBestMatchSubMode: (subMode: BestMatchEngineSubMode) => void;
   // Principal vs Target props
   config: AnalysisConfig;
   prefilledTargetNotice?: string | null;
@@ -46,12 +58,18 @@ interface StepConfigureProps {
   onChangeConfig: (next: AnalysisConfig) => void;
   onRunAnalysis: () => void;
   isRunning: boolean;
-  // Best Matched Candles props
+  // Best Matched Candles (Geometric / Multi-TF) props
   bestMatchConfig: BestMatchConfig;
   onChangeBestMatchConfig: (next: BestMatchConfig) => void;
   onRunBestMatch: () => void;
   isRunningBestMatch: boolean;
   bestMatchProgress: BestMatchProgress | null;
+  // Intraday Time-Slot Direction Correlation props
+  intradayConfig: IntradaySlotMatchConfig;
+  onChangeIntradayConfig: (next: IntradaySlotMatchConfig) => void;
+  onRunIntradayMatch: () => void;
+  prefilledIntradayNotice?: string | null;
+  onDismissPrefilledIntradayNotice?: () => void;
   onBack: () => void;
 }
 
@@ -61,6 +79,8 @@ export function StepConfigure({
   datasets,
   engineMode,
   onChangeEngineMode,
+  bestMatchSubMode,
+  onChangeBestMatchSubMode,
   config,
   prefilledTargetNotice,
   onDismissPrefilledNotice,
@@ -72,9 +92,15 @@ export function StepConfigure({
   onRunBestMatch,
   isRunningBestMatch,
   bestMatchProgress,
+  intradayConfig,
+  onChangeIntradayConfig,
+  onRunIntradayMatch,
+  prefilledIntradayNotice,
+  onDismissPrefilledIntradayNotice,
   onBack,
 }: StepConfigureProps) {
   const [refSearchQuery, setRefSearchQuery] = useState('');
+  const [anchorSlotSearch, setAnchorSlotSearch] = useState('');
 
   const loadedTimeframes = useMemo(
     () =>
@@ -329,6 +355,61 @@ export function StepConfigure({
     });
   };
 
+  // =========================================================================
+  // INTRADAY TIME-SLOT DIRECTION CORRELATION DERIVED STATE
+  // =========================================================================
+  const intradayAnchorDs =
+    datasets[intradayConfig.anchorTimeframe] ?? datasets[loadedTimeframes[0]?.id ?? '1H'];
+
+  const intradayAnchorSlotOptions = useMemo(() => {
+    if (!intradayAnchorDs || intradayAnchorDs.candles.length === 0) return [];
+    return getIntradayTimeSlotOptions(intradayAnchorDs.candles);
+  }, [intradayAnchorDs]);
+
+  const filteredAnchorSlotOptions = useMemo(() => {
+    const q = anchorSlotSearch.trim().toLowerCase();
+    if (!q) return intradayAnchorSlotOptions;
+    return intradayAnchorSlotOptions.filter((opt) => opt.key.toLowerCase().includes(q));
+  }, [intradayAnchorSlotOptions, anchorSlotSearch]);
+
+  const effectiveAnchorSlotKey = useMemo(() => {
+    if (intradayAnchorSlotOptions.some((o) => o.key === intradayConfig.anchorSlotKey)) {
+      return intradayConfig.anchorSlotKey;
+    }
+    return intradayAnchorSlotOptions[0]?.key ?? '';
+  }, [intradayAnchorSlotOptions, intradayConfig.anchorSlotKey]);
+
+  const activeIntradayTargetTfs = useMemo(
+    () =>
+      intradayConfig.targetTimeframes
+        .filter((tf) => Boolean(datasets[tf] && datasets[tf]!.candles.length > 0))
+        .sort((a, b) => TIMEFRAME_MAP[a].rankOrder - TIMEFRAME_MAP[b].rankOrder),
+    [intradayConfig.targetTimeframes, datasets]
+  );
+
+  const intradayScannedRows = useMemo(
+    () => countScannedCandlesForIntradayConfig(datasets, intradayConfig),
+    [datasets, intradayConfig]
+  );
+
+  const intradayWillUseWorker =
+    intradayScannedRows > WORKER_ROW_THRESHOLD ||
+    (intradayConfig.scopeMode === 'full_matrix' && intradayScannedRows > 5_000);
+
+  const canRunIntraday =
+    Boolean(intradayAnchorDs && intradayAnchorDs.candles.length > 0) &&
+    activeIntradayTargetTfs.length >= 1 &&
+    (intradayConfig.scopeMode === 'full_matrix' || effectiveAnchorSlotKey.length > 0) &&
+    !isRunningBestMatch;
+
+  const toggleIntradayTargetTf = (tf: TimeframeId) => {
+    const exists = intradayConfig.targetTimeframes.includes(tf);
+    const next = exists
+      ? intradayConfig.targetTimeframes.filter((id) => id !== tf)
+      : [...intradayConfig.targetTimeframes, tf];
+    onChangeIntradayConfig({ ...intradayConfig, targetTimeframes: next });
+  };
+
   return (
     <div className="space-y-8">
       {/* Header + Engine Mode Switcher */}
@@ -409,7 +490,590 @@ export function StepConfigure({
       {/* ENGINE A: BEST MATCHED CANDLES SEARCH                               */}
       {/* =================================================================== */}
       {engineMode === 'best_matches' ? (
-        <div className="grid grid-cols-1 gap-6 lg:grid-cols-12">
+        <div className="space-y-6">
+          {prefilledIntradayNotice && (
+            <div className="flex items-center justify-between gap-3 rounded border border-amber-500/40 bg-amber-500/10 px-4 py-3 text-xs text-amber-200">
+              <div className="flex items-center gap-2">
+                <Clock className="h-4 w-4 shrink-0 text-amber-400" aria-hidden="true" />
+                <span>
+                  Loaded from Candle Data Collector:{' '}
+                  <strong className="font-mono text-amber-100">{prefilledIntradayNotice}</strong>.
+                  Pick your Target Timeframes below or click Run Intraday Slot Match.
+                </span>
+              </div>
+              {onDismissPrefilledIntradayNotice && (
+                <button
+                  type="button"
+                  aria-label="Dismiss prefilled intraday slot notice"
+                  onClick={onDismissPrefilledIntradayNotice}
+                  className="text-amber-300/80 hover:text-amber-100"
+                >
+                  <X className="h-3.5 w-3.5" aria-hidden="true" />
+                </button>
+              )}
+            </div>
+          )}
+
+          {/* Best Match Engine Sub-Mode Selector */}
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+            <button
+              type="button"
+              onClick={() => onChangeBestMatchSubMode('intraday_slot')}
+              className={`rounded border px-4 py-3.5 text-left transition-colors ${
+                bestMatchSubMode === 'intraday_slot'
+                  ? 'border-amber-500 bg-amber-500/10 text-slate-50'
+                  : 'border-[#1E293B] bg-[#111824] text-slate-300 hover:border-slate-600'
+              }`}
+            >
+              <div className="flex items-center gap-2 text-sm font-semibold">
+                <Clock className="h-4 w-4 text-amber-400" aria-hidden="true" />
+                <span>Mode 1: Intraday Time-Slot Direction Match (Daily Recurrence)</span>
+              </div>
+              <p className="mt-1 text-xs leading-relaxed text-slate-400">
+                Match an anchor time slot (e.g. 00:01 UTC) against all other time slots on the
+                same calendar day across 1 or more timeframes, or run Full-Matrix across all slots.
+              </p>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => onChangeBestMatchSubMode('geometric_pattern')}
+              className={`rounded border px-4 py-3.5 text-left transition-colors ${
+                bestMatchSubMode === 'geometric_pattern'
+                  ? 'border-amber-500 bg-amber-500/10 text-slate-50'
+                  : 'border-[#1E293B] bg-[#111824] text-slate-300 hover:border-slate-600'
+              }`}
+            >
+              <div className="flex items-center gap-2 text-sm font-semibold">
+                <Sparkles className="h-4 w-4 text-amber-400" aria-hidden="true" />
+                <span>Mode 2: Geometric Shape &amp; Multi-TF Alignment</span>
+              </div>
+              <p className="mt-1 text-xs leading-relaxed text-slate-400">
+                Score synchronized multi-timeframe bars or search single-file historical candle
+                sequences using normalized body/wick geometry and optional volume weighting.
+              </p>
+            </button>
+          </div>
+
+          {bestMatchSubMode === 'intraday_slot' ? (
+            /* =============================================================== */
+            /* MODE 1: INTRADAY TIME-SLOT DIRECTION CORRELATION & FULL MATRIX  */
+            /* =============================================================== */
+            <div className="grid grid-cols-1 gap-6 lg:grid-cols-12">
+              {/* Left Configuration Column */}
+              <div className="space-y-6 rounded border border-[#1E293B] bg-[#111824] p-6 lg:col-span-7">
+                {/* Scope Toggle: Single Anchor Time Slot vs All Intraday Time Slots */}
+                <div className="space-y-2">
+                  <span className="block text-xs font-semibold text-slate-200">
+                    Collection Scope
+                  </span>
+                  <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+                    <button
+                      type="button"
+                      onClick={() =>
+                        onChangeIntradayConfig({ ...intradayConfig, scopeMode: 'single_anchor' })
+                      }
+                      className={`rounded border px-4 py-3 text-left transition-colors ${
+                        intradayConfig.scopeMode === 'single_anchor'
+                          ? 'border-amber-500 bg-amber-500/10 text-slate-50'
+                          : 'border-[#1E293B] bg-[#0B0F17] text-slate-300 hover:border-slate-600'
+                      }`}
+                    >
+                      <div className="flex items-center gap-1.5 text-sm font-semibold">
+                        <Clock className="h-3.5 w-3.5 text-amber-400" aria-hidden="true" />
+                        <span>Single Anchor Time Slot</span>
+                      </div>
+                      <p className="mt-0.5 text-xs text-slate-400">
+                        Pick one anchor slot (e.g. 00:01) and rank every same-day target slot by
+                        consistency.
+                      </p>
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() =>
+                        onChangeIntradayConfig({ ...intradayConfig, scopeMode: 'full_matrix' })
+                      }
+                      className={`rounded border px-4 py-3 text-left transition-colors ${
+                        intradayConfig.scopeMode === 'full_matrix'
+                          ? 'border-amber-500 bg-amber-500/10 text-slate-50'
+                          : 'border-[#1E293B] bg-[#0B0F17] text-slate-300 hover:border-slate-600'
+                      }`}
+                    >
+                      <div className="flex items-center gap-1.5 text-sm font-semibold">
+                        <Grid className="h-3.5 w-3.5 text-amber-400" aria-hidden="true" />
+                        <span>All Intraday Time Slots (Full Collection)</span>
+                      </div>
+                      <p className="mt-0.5 text-xs text-slate-400">
+                        Batch-evaluate every unique slot (00:00 → 23:59) to build a master slot
+                        matrix.
+                      </p>
+                    </button>
+                  </div>
+                </div>
+
+                {/* Anchor Timeframe + Anchor Slot Picker */}
+                <div className="grid grid-cols-1 gap-4 border-t border-[#1E293B] pt-5 sm:grid-cols-12">
+                  <div
+                    className={
+                      intradayConfig.scopeMode === 'single_anchor'
+                        ? 'space-y-1.5 sm:col-span-5'
+                        : 'space-y-1.5 sm:col-span-12'
+                    }
+                  >
+                    <label
+                      htmlFor="intraday-anchor-tf"
+                      className="block text-xs font-semibold text-slate-200"
+                    >
+                      Anchor Timeframe
+                    </label>
+                    <select
+                      id="intraday-anchor-tf"
+                      value={intradayAnchorDs?.timeframe ?? ''}
+                      onChange={(e) => {
+                        const nextTf = e.target.value as TimeframeId;
+                        const nextDs = datasets[nextTf];
+                        const nextOpts = nextDs ? getIntradayTimeSlotOptions(nextDs.candles) : [];
+                        const keepSlot = nextOpts.some((o) => o.key === intradayConfig.anchorSlotKey)
+                          ? intradayConfig.anchorSlotKey
+                          : nextOpts[0]?.key ?? '00:00';
+                        onChangeIntradayConfig({
+                          ...intradayConfig,
+                          anchorTimeframe: nextTf,
+                          anchorSlotKey: keepSlot,
+                        });
+                      }}
+                      className="h-10 w-full rounded border border-[#2A3950] bg-[#0B0F17] px-3 font-mono text-sm text-slate-100 focus:border-amber-500 focus:outline-none"
+                    >
+                      {loadedTimeframes.map((tf) => (
+                        <option key={tf.id} value={tf.id}>
+                          {tf.id} — {tf.label} ({datasets[tf.id]!.rowCount.toLocaleString()} rows)
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+
+                  {intradayConfig.scopeMode === 'single_anchor' && (
+                    <div className="space-y-1.5 sm:col-span-7">
+                      <label
+                        htmlFor="intraday-anchor-slot"
+                        className="block text-xs font-semibold text-slate-200"
+                      >
+                        Anchor Time Slot (UTC)
+                      </label>
+                      <div className="grid grid-cols-1 gap-2 sm:grid-cols-12">
+                        <div className="relative sm:col-span-5">
+                          <Search
+                            className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-slate-500"
+                            aria-hidden="true"
+                          />
+                          <input
+                            type="text"
+                            value={anchorSlotSearch}
+                            onChange={(e) => setAnchorSlotSearch(e.target.value)}
+                            placeholder="Filter e.g. 00:01"
+                            aria-label="Filter anchor time slots"
+                            className="h-10 w-full rounded border border-[#2A3950] bg-[#0B0F17] pl-8 pr-2.5 font-mono text-xs text-slate-100 placeholder:text-slate-600 focus:border-amber-500 focus:outline-none"
+                          />
+                        </div>
+                        <div className="sm:col-span-7">
+                          <select
+                            id="intraday-anchor-slot"
+                            value={effectiveAnchorSlotKey}
+                            onChange={(e) =>
+                              onChangeIntradayConfig({
+                                ...intradayConfig,
+                                anchorSlotKey: e.target.value,
+                              })
+                            }
+                            className="h-10 w-full rounded border border-[#2A3950] bg-[#0B0F17] px-3 font-mono text-xs text-slate-100 focus:border-amber-500 focus:outline-none"
+                          >
+                            {filteredAnchorSlotOptions.length === 0 ? (
+                              <option value="">No matching time slots</option>
+                            ) : (
+                              filteredAnchorSlotOptions.map((opt) => (
+                                <option key={opt.key} value={opt.key}>
+                                  {opt.key} UTC ({opt.nonDojiCount.toLocaleString()} non-Doji days)
+                                </option>
+                              ))
+                            )}
+                          </select>
+                        </div>
+                      </div>
+                    </div>
+                  )}
+                </div>
+
+                {/* Target Timeframes Multi-Select */}
+                <div className="space-y-2.5 border-t border-[#1E293B] pt-5">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <span className="text-xs font-semibold text-slate-200">
+                      Target Timeframes to Search ({activeIntradayTargetTfs.length} selected)
+                    </span>
+                    <div className="flex items-center gap-3">
+                      <button
+                        type="button"
+                        onClick={() =>
+                          onChangeIntradayConfig({
+                            ...intradayConfig,
+                            targetTimeframes: [intradayAnchorDs?.timeframe ?? loadedTimeframes[0].id],
+                          })
+                        }
+                        className="text-xs font-medium text-slate-300 hover:text-amber-300"
+                      >
+                        Same Timeframe Only
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          onChangeIntradayConfig({
+                            ...intradayConfig,
+                            targetTimeframes: loadedTimeframes.map((t) => t.id),
+                          })
+                        }
+                        className="inline-flex items-center gap-1 text-xs font-medium text-amber-400 hover:underline"
+                      >
+                        <Layers className="h-3.5 w-3.5" aria-hidden="true" />
+                        <span>All Uploaded ({loadedTimeframes.length})</span>
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="flex flex-wrap gap-2">
+                    {loadedTimeframes.map((tf) => {
+                      const isSelected = intradayConfig.targetTimeframes.includes(tf.id);
+                      return (
+                        <button
+                          key={tf.id}
+                          type="button"
+                          aria-pressed={isSelected}
+                          onClick={() => toggleIntradayTargetTf(tf.id)}
+                          className={`inline-flex h-9 items-center gap-1.5 whitespace-nowrap rounded border px-3 font-mono text-xs font-medium transition-colors ${
+                            isSelected
+                              ? 'border-amber-500 bg-amber-500/15 text-amber-300'
+                              : 'border-[#2A3950] bg-[#0B0F17] text-slate-300 hover:border-slate-500'
+                          }`}
+                        >
+                          {isSelected && <Check className="h-3.5 w-3.5" aria-hidden="true" />}
+                          <span>{tf.id}</span>
+                          <span className="text-[11px] text-slate-500">
+                            ({datasets[tf.id]!.rowCount.toLocaleString()})
+                          </span>
+                        </button>
+                      );
+                    })}
+                  </div>
+
+                  {activeIntradayTargetTfs.length === 0 && (
+                    <p className="text-xs text-amber-400">
+                      Select at least 1 target timeframe above.
+                    </p>
+                  )}
+                </div>
+
+                {/* Direction Filter & Exclude Self-Slot */}
+                <div className="space-y-4 border-t border-[#1E293B] pt-5">
+                  <div className="space-y-2">
+                    <span className="block text-xs font-semibold text-slate-200">
+                      Same-Day Direction Match Filter
+                    </span>
+                    <div className="grid grid-cols-1 gap-1.5 sm:grid-cols-3">
+                      {(
+                        [
+                          { id: 'any_non_doji', label: 'Any Non-Doji Match' },
+                          { id: 'bullish_only', label: 'Bullish Matches Only' },
+                          { id: 'bearish_only', label: 'Bearish Matches Only' },
+                        ] as { id: IntradayDirectionFilter; label: string }[]
+                      ).map((opt) => (
+                        <button
+                          key={opt.id}
+                          type="button"
+                          onClick={() =>
+                            onChangeIntradayConfig({ ...intradayConfig, directionFilter: opt.id })
+                          }
+                          className={`h-9 rounded border px-3 text-xs font-medium transition-colors ${
+                            intradayConfig.directionFilter === opt.id
+                              ? 'border-amber-500 bg-amber-500/15 text-amber-300'
+                              : 'border-[#2A3950] bg-[#0B0F17] text-slate-300 hover:border-slate-500'
+                          }`}
+                        >
+                          {opt.label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  <label className="flex cursor-pointer items-center gap-2.5 text-xs text-slate-200">
+                    <input
+                      type="checkbox"
+                      checked={intradayConfig.excludeSelfSlot}
+                      onChange={(e) =>
+                        onChangeIntradayConfig({
+                          ...intradayConfig,
+                          excludeSelfSlot: e.target.checked,
+                        })
+                      }
+                      className="h-4 w-4 rounded border-[#2A3950] bg-[#0B0F17] accent-amber-500"
+                    />
+                    <span>
+                      Exclude matching the exact anchor slot against itself on the same timeframe
+                    </span>
+                  </label>
+                </div>
+
+                {/* Thresholds: Min Sample Days, Min Match Rate %, Max Results */}
+                <div className="grid grid-cols-1 gap-5 border-t border-[#1E293B] pt-5 sm:grid-cols-2">
+                  <div className="space-y-2">
+                    <div className="flex items-center justify-between">
+                      <label
+                        htmlFor="intraday-min-rate"
+                        className="text-xs font-semibold text-slate-200"
+                      >
+                        Min Match Rate Threshold
+                      </label>
+                      <span className="font-mono text-xs font-semibold tabular-nums text-amber-400">
+                        {intradayConfig.minMatchRatePct}%
+                      </span>
+                    </div>
+                    <input
+                      id="intraday-min-rate"
+                      type="range"
+                      min={0}
+                      max={100}
+                      step={1}
+                      value={intradayConfig.minMatchRatePct}
+                      onChange={(e) =>
+                        onChangeIntradayConfig({
+                          ...intradayConfig,
+                          minMatchRatePct: Number(e.target.value),
+                        })
+                      }
+                      className="w-full accent-amber-500"
+                    />
+                    <div className="flex justify-between font-mono text-[10px] text-slate-500">
+                      <span>0% (All)</span>
+                      <span>50%</span>
+                      <span>100%</span>
+                    </div>
+                  </div>
+
+                  <div className="space-y-1.5">
+                    <label
+                      htmlFor="intraday-min-days"
+                      className="block text-xs font-semibold text-slate-200"
+                    >
+                      Min Co-Occurring Days (Sample N)
+                    </label>
+                    <input
+                      id="intraday-min-days"
+                      type="number"
+                      min={1}
+                      value={intradayConfig.minCoOccurringDays}
+                      onChange={(e) =>
+                        onChangeIntradayConfig({
+                          ...intradayConfig,
+                          minCoOccurringDays: Math.max(1, Number(e.target.value) || 1),
+                        })
+                      }
+                      className="h-10 w-full rounded border border-[#2A3950] bg-[#0B0F17] px-3 font-mono text-xs tabular-nums text-slate-100 focus:border-amber-500 focus:outline-none"
+                    />
+                    <p className="text-[11px] text-slate-500">
+                      Filters out low-sample 1-day statistical noise.
+                    </p>
+                  </div>
+                </div>
+
+                {intradayConfig.scopeMode === 'single_anchor' && (
+                  <div className="space-y-2 border-t border-[#1E293B] pt-5">
+                    <span className="block text-xs font-semibold text-slate-200">
+                      Max Ranked Target Slots Returned
+                    </span>
+                    <div className="grid grid-cols-4 gap-1.5">
+                      {([10, 25, 50, 100] as MaxResultsLimit[]).map((lim) => (
+                        <button
+                          key={lim}
+                          type="button"
+                          onClick={() =>
+                            onChangeIntradayConfig({ ...intradayConfig, maxResults: lim })
+                          }
+                          className={`h-9 rounded border font-mono text-xs font-medium transition-colors ${
+                            intradayConfig.maxResults === lim
+                              ? 'border-amber-500 bg-amber-500/15 text-amber-300'
+                              : 'border-[#2A3950] bg-[#0B0F17] text-slate-300 hover:border-slate-500'
+                          }`}
+                        >
+                          Top {lim}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {/* Optional UTC Date Window */}
+                <div className="space-y-3 border-t border-[#1E293B] pt-5">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <span className="text-xs font-semibold text-slate-200">
+                      UTC Date Window Filter (Optional)
+                    </span>
+                    {(intradayConfig.startDateUtc || intradayConfig.endDateUtc) && (
+                      <button
+                        type="button"
+                        onClick={() =>
+                          onChangeIntradayConfig({
+                            ...intradayConfig,
+                            startDateUtc: '',
+                            endDateUtc: '',
+                          })
+                        }
+                        className="text-xs font-medium text-amber-400 hover:underline"
+                      >
+                        Reset Dates
+                      </button>
+                    )}
+                  </div>
+
+                  <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+                    <div className="space-y-1">
+                      <label htmlFor="intraday-start-date" className="block text-xs text-slate-400">
+                        Start Date (UTC)
+                      </label>
+                      <input
+                        id="intraday-start-date"
+                        type="date"
+                        value={intradayConfig.startDateUtc}
+                        onChange={(e) =>
+                          onChangeIntradayConfig({
+                            ...intradayConfig,
+                            startDateUtc: e.target.value,
+                          })
+                        }
+                        className="h-10 w-full rounded border border-[#2A3950] bg-[#0B0F17] px-3 font-mono text-xs tabular-nums text-slate-100 focus:border-amber-500 focus:outline-none"
+                      />
+                    </div>
+                    <div className="space-y-1">
+                      <label htmlFor="intraday-end-date" className="block text-xs text-slate-400">
+                        End Date (UTC)
+                      </label>
+                      <input
+                        id="intraday-end-date"
+                        type="date"
+                        value={intradayConfig.endDateUtc}
+                        onChange={(e) =>
+                          onChangeIntradayConfig({
+                            ...intradayConfig,
+                            endDateUtc: e.target.value,
+                          })
+                        }
+                        className="h-10 w-full rounded border border-[#2A3950] bg-[#0B0F17] px-3 font-mono text-xs tabular-nums text-slate-100 focus:border-amber-500 focus:outline-none"
+                      />
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              {/* Right Execution Summary Column */}
+              <aside className="flex flex-col justify-between space-y-6 rounded border border-[#1E293B] bg-[#111824] p-6 lg:col-span-5">
+                <div className="space-y-5">
+                  <h2 className="text-sm font-semibold text-slate-100">
+                    Intraday Correlation Scope &amp; Rules
+                  </h2>
+
+                  <dl className="divide-y divide-[#1E293B] text-xs">
+                    <div className="flex justify-between gap-4 py-2.5">
+                      <dt className="text-slate-400">Collection Scope</dt>
+                      <dd className="font-medium text-slate-100">
+                        {intradayConfig.scopeMode === 'single_anchor'
+                          ? 'Single Anchor Time Slot'
+                          : 'All Intraday Slots (Full Matrix)'}
+                      </dd>
+                    </div>
+                    <div className="flex justify-between gap-4 py-2.5">
+                      <dt className="text-slate-400">Anchor Slot</dt>
+                      <dd className="font-mono text-amber-300">
+                        {intradayAnchorDs?.timeframe ?? '—'}{' '}
+                        {intradayConfig.scopeMode === 'single_anchor'
+                          ? `${effectiveAnchorSlotKey || '—'} UTC`
+                          : `(${intradayAnchorSlotOptions.length} slots)`}
+                      </dd>
+                    </div>
+                    <div className="flex justify-between gap-4 py-2.5">
+                      <dt className="text-slate-400">Target Timeframes</dt>
+                      <dd className="font-mono text-slate-100">
+                        {activeIntradayTargetTfs.join(' · ') || 'None'}
+                      </dd>
+                    </div>
+                    <div className="flex justify-between gap-4 py-2.5">
+                      <dt className="text-slate-400">Rows in Scope</dt>
+                      <dd className="font-mono tabular-nums text-slate-100">
+                        {intradayScannedRows.toLocaleString()} candles
+                        {intradayWillUseWorker ? ' (Web Worker)' : ''}
+                      </dd>
+                    </div>
+                    <div className="flex justify-between gap-4 py-2.5">
+                      <dt className="text-slate-400">Day Pairing Rule</dt>
+                      <dd className="text-right text-slate-200">
+                        Same UTC Date (YYYY-MM-DD) · Excl. Anchor Dojis
+                      </dd>
+                    </div>
+                    <div className="flex justify-between gap-4 py-2.5">
+                      <dt className="text-slate-400">Qualification Filters</dt>
+                      <dd className="font-mono tabular-nums text-amber-300">
+                        N ≥ {intradayConfig.minCoOccurringDays}d · Rate ≥{' '}
+                        {intradayConfig.minMatchRatePct}%
+                      </dd>
+                    </div>
+                  </dl>
+
+                  {isRunningBestMatch && bestMatchProgress && (
+                    <div className="space-y-1.5 rounded border border-[#1E293B] bg-[#0B0F17] p-3">
+                      <div className="flex justify-between text-xs">
+                        <span className="text-slate-300">
+                          Running intraday {bestMatchProgress.stage} pass...
+                        </span>
+                        <span className="font-mono tabular-nums text-amber-400">
+                          {bestMatchProgress.percent}%
+                        </span>
+                      </div>
+                      <div className="h-1.5 w-full overflow-hidden rounded bg-[#111824]">
+                        <div
+                          className="h-full bg-amber-500 transition-transform duration-150"
+                          style={{
+                            transform: `scaleX(${bestMatchProgress.percent / 100})`,
+                            transformOrigin: 'left',
+                          }}
+                        />
+                      </div>
+                    </div>
+                  )}
+                </div>
+
+                <div className="space-y-3 border-t border-[#1E293B] pt-5">
+                  <button
+                    type="button"
+                    disabled={!canRunIntraday}
+                    onClick={onRunIntradayMatch}
+                    className="inline-flex h-11 w-full items-center justify-center gap-2 rounded bg-amber-500 px-5 text-sm font-semibold text-slate-950 transition-colors hover:bg-amber-400 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-amber-400 disabled:cursor-not-allowed disabled:bg-slate-800 disabled:text-slate-500"
+                  >
+                    <Play className="h-4 w-4 fill-current" aria-hidden="true" />
+                    <span>
+                      {isRunningBestMatch
+                        ? 'Computing Daily Matches...'
+                        : intradayConfig.scopeMode === 'full_matrix'
+                          ? 'Collect All Intraday Slots'
+                          : 'Run Intraday Slot Match'}
+                    </span>
+                  </button>
+                  <p className="text-center text-[11px] text-slate-500">
+                    Strict UTC calendar-day pairing · Ranked by highest recurring direction match
+                  </p>
+                </div>
+              </aside>
+            </div>
+          ) : (
+            /* =============================================================== */
+            /* MODE 2: GEOMETRIC SHAPE & MULTI-TF ALIGNMENT (EXISTING)         */
+            /* =============================================================== */
+            <div className="grid grid-cols-1 gap-6 lg:grid-cols-12">
           {/* Left Configuration Column */}
           <div className="space-y-6 rounded border border-[#1E293B] bg-[#111824] p-6 lg:col-span-7">
             {/* Search Scope Switcher */}
@@ -963,7 +1627,7 @@ export function StepConfigure({
                 </div>
               </dl>
 
-              {isRunningBestMatch && bestMatchProgress && (
+                {isRunningBestMatch && bestMatchProgress && (
                 <div className="space-y-1.5 rounded border border-[#1E293B] bg-[#0B0F17] p-3">
                   <div className="flex justify-between text-xs">
                     <span className="text-slate-300">
@@ -1005,6 +1669,8 @@ export function StepConfigure({
               </p>
             </div>
           </aside>
+        </div>
+          )}
         </div>
       ) : (
         /* ================================================================= */
