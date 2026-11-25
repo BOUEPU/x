@@ -270,3 +270,102 @@ export interface CollectorResult {
   warningMessage: string | null;
 }
 
+// ============================================================================
+// Best Matched Candles Search Types (Multi-Timeframe & Single-File Modes)
+// ============================================================================
+
+export type StepEngineMode = 'best_matches' | 'principal_target';
+
+export type BestMatchSearchScope = 'multi_tf' | 'single_file';
+
+export type MultiTfAnchorMode = 'lowest_tf' | 'parent_window';
+
+export type SingleFileSubMode = 'reference' | 'auto_scan';
+
+export type SequenceLength = 1 | 2 | 3;
+
+export type MaxResultsLimit = 10 | 25 | 50 | 100;
+
+export interface CandleGeometryFeatures {
+  range: number;          // High - Low
+  bodySize: number;       // |Close - Open|
+  bodyRatio: number;      // 0..1 (0 when range === 0)
+  upperWickRatio: number; // 0..1
+  lowerWickRatio: number; // 0..1
+  atr14: number;          // Rolling 14-candle range average
+  rangeAtrRatio: number;  // range / atr14 (0 if flat and atr14 === 0)
+  volumeRatio: number;    // volume / rolling 20-candle average volume (1 if avgVol === 0)
+}
+
+export interface BestMatchConfig {
+  scope: BestMatchSearchScope;
+  // Mode A: Cross-Timeframe Match Search
+  selectedTimeframes: TimeframeId[];
+  multiTfAnchor: MultiTfAnchorMode;
+  // Mode B: Single-File / Intra-Timeframe Pattern Match Search
+  singleTimeframe: TimeframeId;
+  singleSubMode: SingleFileSubMode;
+  sequenceLength: SequenceLength;
+  referenceTimestamp: number | null; // null => Use Latest Candle/Sequence in File
+  includeVolumeWeight: boolean;
+  // Shared Scoring & Output Controls
+  minMatchScore: number; // 0..100 (default 75)
+  maxResults: MaxResultsLimit;
+  startDateUtc: string;
+  endDateUtc: string;
+}
+
+export interface MatchedCandleSnapshot {
+  timeframe: TimeframeId;
+  roleLabel: string; // e.g. '1H' or 'Bar 1 of 3'
+  candle: EnrichedCandle;
+  features: CandleGeometryFeatures;
+}
+
+export interface BestMatchItem {
+  id: string;
+  rank: number;
+  anchorTimeframe: TimeframeId;
+  timestamp: number;
+  timeStr: string;
+  endTimeStr: string;
+  matchScore: number;       // 0..100 composite score
+  directionalScore: number; // 0..100
+  structuralScore: number;  // 0..100
+  volumeScore: number | null;
+  dominantDirection: CandleType;
+  patternLabel: string;
+  summaryDetail: string;
+  snapshots: MatchedCandleSnapshot[];
+}
+
+export interface BestMatchProgress {
+  percent: number;
+  scanned: number;
+  total: number;
+  stage: 'indexing' | 'scoring' | 'ranking';
+}
+
+export interface BestMatchResult {
+  config: BestMatchConfig;
+  scope: BestMatchSearchScope;
+  activeTimeframes: TimeframeId[];
+  referenceSnapshots: MatchedCandleSnapshot[] | null;
+  totalCandidatesScanned: number;
+  totalAboveThreshold: number;
+  effectiveStartUtc: string | null;
+  effectiveEndUtc: string | null;
+  matches: BestMatchItem[];
+  warningMessage: string | null;
+  computedAtUtc: string;
+  computeDurationMs: number;
+  usedWorker: boolean;
+}
+
+export interface BestMatchFilterState {
+  searchQuery: string;
+  directionFilter: 'all' | 'bullish' | 'bearish' | 'doji';
+  minScoreOverride: number;
+}
+
+

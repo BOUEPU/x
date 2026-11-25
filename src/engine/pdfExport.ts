@@ -3,6 +3,9 @@ import autoTable from 'jspdf-autotable';
 import { formatDecimal } from './csvParser';
 import {
   AnalysisResult,
+  BestMatchFilterState,
+  BestMatchItem,
+  BestMatchResult,
   CollectedCandleSlot,
   CollectorResult,
   PrincipalCandidateResult,
@@ -520,4 +523,200 @@ export function exportCollectedSummaryPdf(
 
   doc.save(`btc_candle_collector_${scopeSlug}_report.pdf`);
 }
+
+/**
+ * Generates a formatted institutional PDF report for Best Matched Candles Search results.
+ */
+export function exportBestMatchesReportPdf(
+  result: BestMatchResult,
+  filteredMatches: BestMatchItem[],
+  filters: BestMatchFilterState
+): void {
+  const doc = new jsPDF({
+    orientation: 'landscape',
+    unit: 'pt',
+    format: 'a4',
+  });
+
+  const pageWidth = doc.internal.pageSize.getWidth();
+  const marginX = 34;
+
+  // Header Banner
+  doc.setFillColor(11, 15, 23);
+  doc.rect(0, 0, pageWidth, 74, 'F');
+
+  doc.setTextColor(245, 158, 11);
+  doc.setFont('helvetica', 'bold');
+  doc.setFontSize(9);
+  doc.text('BEST MATCHED CANDLES SEARCH REPORT', marginX, 24);
+
+  doc.setTextColor(248, 250, 252);
+  doc.setFontSize(17);
+  doc.text('BTC Multi-Timeframe Candle Correlation Analyzer', marginX, 46);
+
+  doc.setTextColor(148, 163, 184);
+  doc.setFont('helvetica', 'normal');
+  doc.setFontSize(9);
+  doc.text(`Generated (UTC): ${result.computedAtUtc}`, marginX, 62);
+  doc.text(
+    result.scope === 'multi_tf'
+      ? `Mode: Cross-Timeframe (${result.activeTimeframes.join(' + ')})`
+      : `Mode: Single-File (${result.config.singleTimeframe} · ${result.config.singleSubMode === 'reference' ? `Ref K=${result.config.sequenceLength}` : `Auto-Scan K=${result.config.sequenceLength}`})`,
+    pageWidth - marginX,
+    62,
+    { align: 'right' }
+  );
+
+  let cursorY = 92;
+  const topMatch = filteredMatches[0] ?? null;
+
+  doc.setTextColor(15, 23, 42);
+  doc.setFont('helvetica', 'bold');
+  doc.setFontSize(11);
+  doc.text('1. Search Scope & Executive Summary', marginX, cursorY);
+  cursorY += 10;
+
+  const dateRange =
+    result.effectiveStartUtc && result.effectiveEndUtc
+      ? `${result.effectiveStartUtc} to ${result.effectiveEndUtc} (UTC)`
+      : 'Full Available UTC Range';
+
+  autoTable(doc, {
+    startY: cursorY,
+    margin: { left: marginX, right: marginX },
+    theme: 'grid',
+    styles: {
+      fontSize: 8.5,
+      cellPadding: 5.5,
+      textColor: [30, 41, 59],
+      lineColor: [203, 213, 225],
+      lineWidth: 0.5,
+    },
+    headStyles: {
+      fillColor: [30, 41, 59],
+      textColor: [248, 250, 252],
+      fontStyle: 'bold',
+    },
+    head: [['Parameter', 'Value', 'Parameter', 'Value']],
+    body: [
+      [
+        'Active Timeframes',
+        result.activeTimeframes.join(', ') || 'None',
+        'Candidates Scanned',
+        result.totalCandidatesScanned.toLocaleString(),
+      ],
+      [
+        'Top Ranked Match',
+        topMatch
+          ? `${topMatch.timeStr} (${topMatch.matchScore.toFixed(2)}% · ${topMatch.patternLabel})`
+          : 'No matches above threshold',
+        'UTC Coverage',
+        dateRange,
+      ],
+      [
+        'Min Match Score Filter',
+        `>= ${Math.max(result.config.minMatchScore, filters.minScoreOverride)}%`,
+        'Matches Shown',
+        `${filteredMatches.length} of ${result.totalAboveThreshold.toLocaleString()} qualifying`,
+      ],
+      [
+        'Execution Mode',
+        result.usedWorker ? 'Web Worker (Off-Thread)' : 'Direct Deterministic Engine',
+        'Compute Duration',
+        `${result.computeDurationMs.toFixed(1)} ms`,
+      ],
+    ],
+  });
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  cursorY = ((doc as any).lastAutoTable?.finalY ?? cursorY + 110) + 18;
+
+  doc.setTextColor(15, 23, 42);
+  doc.setFont('helvetica', 'bold');
+  doc.setFontSize(11);
+  doc.text(`2. Ranked Best Matched Candles (${filteredMatches.length} results)`, marginX, cursorY);
+  cursorY += 10;
+
+  const bodyRows = filteredMatches.map((m, idx) => [
+    `#${idx + 1}`,
+    m.timeStr,
+    m.anchorTimeframe,
+    `${m.matchScore.toFixed(2)}%`,
+    `${m.directionalScore.toFixed(1)}%`,
+    `${m.structuralScore.toFixed(1)}%`,
+    m.volumeScore !== null ? `${m.volumeScore.toFixed(1)}%` : '—',
+    m.dominantDirection,
+    m.patternLabel,
+    m.snapshots
+      .map((s) => `${s.roleLabel}: ${s.candle.candleType} (O ${s.candle.open} -> C ${s.candle.close})`)
+      .join(' | '),
+  ]);
+
+  autoTable(doc, {
+    startY: cursorY,
+    margin: { left: marginX, right: marginX },
+    theme: 'striped',
+    styles: {
+      fontSize: 7.5,
+      cellPadding: 4.5,
+      textColor: [15, 23, 42],
+      lineColor: [226, 232, 240],
+      lineWidth: 0.4,
+    },
+    headStyles: {
+      fillColor: [15, 23, 42],
+      textColor: [248, 250, 252],
+      fontStyle: 'bold',
+    },
+    alternateRowStyles: {
+      fillColor: [248, 250, 252],
+    },
+    columnStyles: {
+      0: { halign: 'center', cellWidth: 32 },
+      3: { halign: 'right', fontStyle: 'bold' },
+      4: { halign: 'right' },
+      5: { halign: 'right' },
+      6: { halign: 'right' },
+    },
+    head: [
+      [
+        'Rank',
+        'Start Time (UTC)',
+        'Anchor',
+        'Match %',
+        'Dir %',
+        'Struct %',
+        'Vol %',
+        'Direction',
+        'Setup / Pattern',
+        'Candle Snapshots',
+      ],
+    ],
+    body:
+      bodyRows.length > 0
+        ? bodyRows
+        : [['—', 'No matched candles meet current thresholds', '—', '—', '—', '—', '—', '—', '—', '—']],
+    didDrawPage: (data) => {
+      const pageHeight = doc.internal.pageSize.getHeight();
+      doc.setFontSize(8);
+      doc.setTextColor(100, 116, 139);
+      doc.text(
+        'BTC Multi-Timeframe Candle Correlation Analyzer · Best Matched Candles Report',
+        marginX,
+        pageHeight - 18
+      );
+      doc.text(`Page ${data.pageNumber}`, pageWidth - marginX, pageHeight - 18, {
+        align: 'right',
+      });
+    },
+  });
+
+  const scopeSlug =
+    result.scope === 'multi_tf'
+      ? `multi_${result.activeTimeframes.join('_').toLowerCase()}`
+      : `single_${result.config.singleTimeframe.toLowerCase()}`;
+
+  doc.save(`btc_best_matches_${scopeSlug}.pdf`);
+}
+
 

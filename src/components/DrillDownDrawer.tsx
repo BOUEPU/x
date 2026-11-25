@@ -1,11 +1,20 @@
 import { useEffect, useMemo, useState } from 'react';
 import { ChevronLeft, ChevronRight, X } from 'lucide-react';
 import { formatDecimal } from '../engine/csvParser';
-import { PrincipalCandidateResult } from '../engine/types';
+import {
+  BestMatchItem,
+  BestMatchSearchScope,
+  MatchedCandleSnapshot,
+  PrincipalCandidateResult,
+} from '../engine/types';
+import { CandlestickComparisonPanel } from './CandleGlyph';
 
 interface DrillDownDrawerProps {
-  candidate: PrincipalCandidateResult | null;
-  targetDescription: string;
+  candidate?: PrincipalCandidateResult | null;
+  targetDescription?: string;
+  bestMatch?: BestMatchItem | null;
+  referenceSnapshots?: MatchedCandleSnapshot[] | null;
+  bestMatchScope?: BestMatchSearchScope;
   onClose: () => void;
 }
 
@@ -14,8 +23,11 @@ type PairFilter = 'all' | 'match' | 'mismatch' | 'doji';
 const PAGE_SIZE = 100;
 
 export function DrillDownDrawer({
-  candidate,
-  targetDescription,
+  candidate = null,
+  targetDescription = '',
+  bestMatch = null,
+  referenceSnapshots = null,
+  bestMatchScope,
   onClose,
 }: DrillDownDrawerProps) {
   const [pairFilter, setPairFilter] = useState<PairFilter>('all');
@@ -24,16 +36,18 @@ export function DrillDownDrawer({
   useEffect(() => {
     setPairFilter('all');
     setPage(1);
-  }, [candidate?.slotKey]);
+  }, [candidate?.slotKey, bestMatch?.id]);
+
+  const isOpen = Boolean(candidate || bestMatch);
 
   useEffect(() => {
-    if (!candidate) return;
+    if (!isOpen) return;
     const handleKey = (e: KeyboardEvent) => {
       if (e.key === 'Escape') onClose();
     };
     window.addEventListener('keydown', handleKey);
     return () => window.removeEventListener('keydown', handleKey);
-  }, [candidate, onClose]);
+  }, [isOpen, onClose]);
 
   const counts = useMemo(() => {
     if (!candidate) return { all: 0, match: 0, mismatch: 0, doji: 0 };
@@ -56,6 +70,229 @@ export function DrillDownDrawer({
     return candidate.pairs.filter((p) => !p.isDojiExcluded && !p.isMatch);
   }, [candidate, pairFilter]);
 
+  if (!isOpen) return null;
+
+  // =========================================================================
+  // BEST MATCHED CANDLES INSPECTION VIEW
+  // =========================================================================
+  if (bestMatch) {
+    const isSingleFile = bestMatchScope === 'single_file';
+    const hasReference = Boolean(referenceSnapshots && referenceSnapshots.length > 0);
+
+    return (
+      <div
+        className="fixed inset-0 z-50 flex justify-end bg-black/70 backdrop-blur-[2px]"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="drilldown-match-title"
+        onClick={(e) => {
+          if (e.target === e.currentTarget) onClose();
+        }}
+      >
+        <div className="flex h-full w-full max-w-5xl flex-col border-l border-[#1E293B] bg-[#0B0F17] shadow-2xl">
+          {/* Header */}
+          <div className="flex items-start justify-between gap-4 border-b border-[#1E293B] bg-[#111824] px-6 py-5">
+            <div className="space-y-1">
+              <p className="text-xs font-medium text-amber-400">
+                Match Verification Breakdown · Rank #{bestMatch.rank} ·{' '}
+                {isSingleFile ? 'Single-File Pattern Search' : 'Cross-Timeframe Alignment'}
+              </p>
+              <h2
+                id="drilldown-match-title"
+                className="font-mono text-xl font-bold text-slate-50"
+              >
+                {bestMatch.timeStr}{' '}
+                <span className="text-sm font-normal text-slate-400">
+                  ({bestMatch.patternLabel})
+                </span>
+              </h2>
+              <p className="font-mono text-xs tabular-nums text-slate-400">
+                Window End: {bestMatch.endTimeStr} UTC · Anchor {bestMatch.anchorTimeframe}
+              </p>
+            </div>
+
+            <button
+              type="button"
+              aria-label="Close match inspection drawer"
+              onClick={onClose}
+              className="inline-flex h-9 w-9 items-center justify-center rounded border border-[#1E293B] bg-[#0B0F17] text-slate-400 transition-colors hover:border-slate-600 hover:text-slate-100"
+            >
+              <X className="h-4 w-4" aria-hidden="true" />
+            </button>
+          </div>
+
+          {/* Score Breakdown Strip */}
+          <div className="grid grid-cols-2 divide-x divide-y divide-[#1E293B] border-b border-[#1E293B] bg-[#0D131E] sm:grid-cols-5 sm:divide-y-0">
+            <div className="px-4 py-3">
+              <p className="text-[11px] text-slate-400">Composite Match</p>
+              <p className="mt-0.5 font-mono text-base font-semibold tabular-nums text-emerald-400">
+                {bestMatch.matchScore.toFixed(2)}%
+              </p>
+            </div>
+            <div className="px-4 py-3">
+              <p className="text-[11px] text-slate-400">Directional Align</p>
+              <p className="mt-0.5 font-mono text-base font-semibold tabular-nums text-slate-100">
+                {bestMatch.directionalScore.toFixed(1)}%
+              </p>
+            </div>
+            <div className="px-4 py-3">
+              <p className="text-[11px] text-slate-400">Structural Similarity</p>
+              <p className="mt-0.5 font-mono text-base font-semibold tabular-nums text-sky-300">
+                {bestMatch.structuralScore.toFixed(1)}%
+              </p>
+            </div>
+            <div className="px-4 py-3">
+              <p className="text-[11px] text-slate-400">Volume Similarity</p>
+              <p className="mt-0.5 font-mono text-base font-semibold tabular-nums text-slate-200">
+                {bestMatch.volumeScore !== null ? `${bestMatch.volumeScore.toFixed(1)}%` : 'Off'}
+              </p>
+            </div>
+            <div className="col-span-2 px-4 py-3 sm:col-span-1">
+              <p className="text-[11px] text-slate-400">Dominant Polarity</p>
+              <p
+                className={`mt-0.5 font-mono text-base font-semibold ${
+                  bestMatch.dominantDirection === 'BULLISH'
+                    ? 'text-emerald-400'
+                    : bestMatch.dominantDirection === 'BEARISH'
+                      ? 'text-red-400'
+                      : 'text-amber-400'
+                }`}
+              >
+                {bestMatch.dominantDirection}
+              </p>
+            </div>
+          </div>
+
+          {/* Scrollable Body: Candlestick Geometry Comparison + Full OHLCV Table */}
+          <div className="flex-1 space-y-6 overflow-auto p-6">
+            {/* Visual Candlestick Geometry Comparison */}
+            <section aria-label="Visual candlestick geometry comparison" className="space-y-3">
+              <div className="flex flex-wrap items-baseline justify-between gap-2">
+                <h3 className="text-xs font-semibold uppercase tracking-wider text-slate-300">
+                  Candlestick Geometry Comparison
+                </h3>
+                <span className="text-[11px] text-slate-500">
+                  {hasReference
+                    ? 'Normalized sequence scale per window (shape & wick proportions)'
+                    : isSingleFile
+                      ? 'Shared price scale across matched sequence bars'
+                      : 'Independent price scale per timeframe to compare body & wick geometry'}
+                </span>
+              </div>
+
+              {hasReference && referenceSnapshots ? (
+                <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+                  <CandlestickComparisonPanel
+                    title="Target Reference Pattern"
+                    subtitle={referenceSnapshots[0]?.candle.timeStr ?? ''}
+                    snapshots={referenceSnapshots}
+                    sharedScale={true}
+                  />
+                  <CandlestickComparisonPanel
+                    title={`Historical Match (#${bestMatch.rank})`}
+                    subtitle={bestMatch.timeStr}
+                    snapshots={bestMatch.snapshots}
+                    sharedScale={true}
+                  />
+                </div>
+              ) : (
+                <CandlestickComparisonPanel
+                  title={
+                    isSingleFile
+                      ? `Matched ${bestMatch.snapshots.length}-Bar Setup`
+                      : `Aligned ${bestMatch.snapshots.length}-Timeframe Snapshot`
+                  }
+                  subtitle={bestMatch.summaryDetail}
+                  snapshots={bestMatch.snapshots}
+                  sharedScale={isSingleFile}
+                />
+              )}
+            </section>
+
+            {/* Full OHLCV & Structural Vector Breakdown Table */}
+            <section aria-label="OHLCV and structural feature breakdown" className="space-y-2.5">
+              <h3 className="text-xs font-semibold uppercase tracking-wider text-slate-300">
+                Full OHLCV &amp; Structural Feature Vector
+              </h3>
+
+              <div className="overflow-hidden rounded border border-[#1E293B] bg-[#111824]">
+                <div className="overflow-x-auto">
+                  <table className="w-full border-collapse text-left text-xs">
+                    <thead>
+                      <tr className="border-b border-[#1E293B] bg-[#0D131E] text-slate-400">
+                        <th className="px-3.5 py-2.5 font-medium">Role / TF</th>
+                        <th className="px-3.5 py-2.5 font-medium">Time (UTC)</th>
+                        <th className="px-3 py-2.5 text-right font-medium">Open</th>
+                        <th className="px-3 py-2.5 text-right font-medium">High</th>
+                        <th className="px-3 py-2.5 text-right font-medium">Low</th>
+                        <th className="px-3 py-2.5 text-right font-medium">Close</th>
+                        <th className="px-3 py-2.5 text-right font-medium">Volume</th>
+                        <th className="px-3 py-2.5 font-medium">Type</th>
+                        <th className="px-3 py-2.5 text-right font-medium">Body %</th>
+                        <th className="px-3 py-2.5 text-right font-medium">Up Wick %</th>
+                        <th className="px-3 py-2.5 text-right font-medium">Low Wick %</th>
+                        <th className="px-3 py-2.5 text-right font-medium">Range/ATR</th>
+                        <th className="px-3.5 py-2.5 text-right font-medium">Vol Ratio</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-[#1E293B] font-mono tabular-nums">
+                      {bestMatch.snapshots.map((s, idx) => (
+                        <tr key={`match-${s.timeframe}-${s.candle.timestamp}-${idx}`} className="hover:bg-[#162032]/60">
+                          <td className="whitespace-nowrap px-3.5 py-2.5 font-semibold text-slate-100">
+                            {s.roleLabel}
+                          </td>
+                          <td className="whitespace-nowrap px-3.5 py-2.5 text-slate-300">
+                            {s.candle.timeStr}
+                          </td>
+                          <td className="px-3 py-2.5 text-right text-slate-300">{s.candle.open}</td>
+                          <td className="px-3 py-2.5 text-right text-slate-300">{s.candle.high}</td>
+                          <td className="px-3 py-2.5 text-right text-slate-300">{s.candle.low}</td>
+                          <td className="px-3 py-2.5 text-right text-slate-200">{s.candle.close}</td>
+                          <td className="px-3 py-2.5 text-right text-slate-400">
+                            {formatDecimal(s.candle.volume, 4)}
+                          </td>
+                          <td
+                            className={`px-3 py-2.5 font-semibold ${
+                              s.candle.candleType === 'BULLISH'
+                                ? 'text-emerald-400'
+                                : s.candle.candleType === 'BEARISH'
+                                  ? 'text-red-400'
+                                  : 'text-amber-400'
+                            }`}
+                          >
+                            {s.candle.candleType}
+                          </td>
+                          <td className="px-3 py-2.5 text-right text-slate-100">
+                            {(s.features.bodyRatio * 100).toFixed(1)}%
+                          </td>
+                          <td className="px-3 py-2.5 text-right text-slate-300">
+                            {(s.features.upperWickRatio * 100).toFixed(1)}%
+                          </td>
+                          <td className="px-3 py-2.5 text-right text-slate-300">
+                            {(s.features.lowerWickRatio * 100).toFixed(1)}%
+                          </td>
+                          <td className="px-3 py-2.5 text-right text-sky-300">
+                            {s.features.rangeAtrRatio.toFixed(2)}x
+                          </td>
+                          <td className="px-3.5 py-2.5 text-right text-amber-300">
+                            {s.features.volumeRatio.toFixed(2)}x
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            </section>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // =========================================================================
+  // PRINCIPAL VS TARGET DATE-BY-DATE BREAKDOWN VIEW (EXISTING)
+  // =========================================================================
   if (!candidate) return null;
 
   const totalPages = Math.max(1, Math.ceil(filteredPairs.length / PAGE_SIZE));
@@ -291,3 +528,4 @@ export function DrillDownDrawer({
     </div>
   );
 }
+

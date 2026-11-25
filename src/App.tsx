@@ -11,20 +11,30 @@ import {
   DEFAULT_COLLECTOR_GROUPING,
 } from './engine/collector';
 import {
+  filterAndRankBestMatches,
   filterAndRankCandidates,
   getAvailableSlotsForTimeframe,
   runCorrelationAnalysis,
 } from './engine/correlation';
 import { parseTimeframeFile } from './engine/parseFile';
-import { exportCorrelationReportPdf } from './engine/pdfExport';
+import {
+  exportBestMatchesReportPdf,
+  exportCorrelationReportPdf,
+} from './engine/pdfExport';
+import { executeBestMatchSearchAsync } from './engine/runBestMatch';
 import {
   AnalysisConfig,
   AnalysisResult,
+  BestMatchConfig,
+  BestMatchFilterState,
+  BestMatchProgress,
+  BestMatchResult,
   CollectedCandleSlot,
   CollectorConfig,
   CollectorResult,
   ParseProgress,
   ResultsFilterState,
+  StepEngineMode,
   TimeframeDataset,
   TimeframeId,
   TIMEFRAMES,
@@ -40,6 +50,35 @@ const DEFAULT_FILTERS: ResultsFilterState = {
   startDateUtc: '',
   endDateUtc: '',
 };
+
+const DEFAULT_BEST_MATCH_FILTERS: BestMatchFilterState = {
+  searchQuery: '',
+  directionFilter: 'all',
+  minScoreOverride: 0,
+};
+
+function buildDefaultBestMatchConfig(
+  datasets: Partial<Record<TimeframeId, TimeframeDataset>>
+): BestMatchConfig {
+  const loadedIds = TIMEFRAMES.filter(
+    (tf) => datasets[tf.id] && datasets[tf.id]!.candles.length > 0
+  ).map((tf) => tf.id);
+
+  return {
+    scope: loadedIds.length >= 2 ? 'multi_tf' : 'single_file',
+    selectedTimeframes: loadedIds,
+    multiTfAnchor: 'lowest_tf',
+    singleTimeframe: loadedIds[0] ?? '1H',
+    singleSubMode: 'reference',
+    sequenceLength: 1,
+    referenceTimestamp: null,
+    includeVolumeWeight: false,
+    minMatchScore: 75,
+    maxResults: 25,
+    startDateUtc: '',
+    endDateUtc: '',
+  };
+}
 
 function buildDefaultConfig(
   datasets: Partial<Record<TimeframeId, TimeframeDataset>>
@@ -95,11 +134,23 @@ export default function App() {
   const [parseErrors, setParseErrors] = useState<Partial<Record<TimeframeId, string>>>({});
   const [selectedPreviewTf, setSelectedPreviewTf] = useState<TimeframeId | null>(null);
 
+  const [engineMode, setEngineMode] = useState<StepEngineMode>('best_matches');
   const [config, setConfig] = useState<AnalysisConfig>(() => buildDefaultConfig({}));
   const [prefilledTargetNotice, setPrefilledTargetNotice] = useState<string | null>(null);
   const [analysisResult, setAnalysisResult] = useState<AnalysisResult | null>(null);
   const [isRunningAnalysis, setIsRunningAnalysis] = useState(false);
   const [filters, setFilters] = useState<ResultsFilterState>(DEFAULT_FILTERS);
+
+  // Best Matched Candles Search state
+  const [bestMatchConfig, setBestMatchConfig] = useState<BestMatchConfig>(() =>
+    buildDefaultBestMatchConfig({})
+  );
+  const [bestMatchResult, setBestMatchResult] = useState<BestMatchResult | null>(null);
+  const [isRunningBestMatch, setIsRunningBestMatch] = useState(false);
+  const [bestMatchProgress, setBestMatchProgress] = useState<BestMatchProgress | null>(null);
+  const [bestMatchFilters, setBestMatchFilters] = useState<BestMatchFilterState>(
+    DEFAULT_BEST_MATCH_FILTERS
+  );
 
   // Candle Data Collector state
   const [collectorConfig, setCollectorConfig] = useState<CollectorConfig>({
@@ -121,12 +172,14 @@ export default function App() {
   );
 
   const isParsingAny = Object.keys(parseProgress).length > 0;
+  const activeHasResults =
+    engineMode === 'best_matches' ? Boolean(bestMatchResult) : Boolean(analysisResult);
 
   const maxUnlockedStep: 1 | 2 | 3 | 4 = useMemo(() => {
     if (loadedTimeframes.length === 0) return 1;
-    if (analysisResult) return 4;
+    if (activeHasResults) return 4;
     return 3;
-  }, [loadedTimeframes.length, analysisResult]);
+  }, [loadedTimeframes.length, activeHasResults]);
 
   const handleUploadFile = useCallback(async (tf: TimeframeId, file: File) => {
     setParseErrors((prev) => {
@@ -153,6 +206,7 @@ export default function App() {
       setDatasets((prev) => ({ ...prev, [tf]: dataset }));
       setSelectedPreviewTf(tf);
       setAnalysisResult(null);
+      setBestMatchResult(null);
       setCollectorResult(null);
     } catch (err) {
       const message =
@@ -180,6 +234,7 @@ export default function App() {
     });
     setSelectedPreviewTf((cur) => (cur === tf ? null : cur));
     setAnalysisResult(null);
+    setBestMatchResult(null);
     setCollectorResult(null);
   }, []);
 
@@ -188,6 +243,8 @@ export default function App() {
     setParseErrors({});
     setSelectedPreviewTf(null);
     setAnalysisResult(null);
+    setBestMatchResult(null);
+    setBestMatchProgress(null);
     setCollectorResult(null);
     setPrefilledTargetNotice(null);
     setCurrentStep(1);
@@ -213,10 +270,14 @@ export default function App() {
 
   const syncConfigWithDatasets = useCallback(
     (targetDatasets: Partial<Record<TimeframeId, TimeframeDataset>>) => {
+      const loadedIds = TIMEFRAMES.filter(
+        (t) => Boolean(targetDatasets[t.id] && targetDatasets[t.id]!.candles.length > 0)
+      ).map((t) => t.id);
+
       setConfig((prev) => {
         const targetExists = Boolean(targetDatasets[prev.targetTimeframe]);
         const searchExists = Boolean(targetDatasets[prev.searchTimeframe]);
-        const loadedCount = TIMEFRAMES.filter((t) => Boolean(targetDatasets[t.id])).length;
+        const loadedCount = loadedIds.length;
 
         if (!targetExists || (prev.mode === 'cross' && (!searchExists || loadedCount < 2))) {
           return buildDefaultConfig(targetDatasets);
@@ -226,8 +287,48 @@ export default function App() {
         }
         return prev;
       });
+
+      setBestMatchConfig((prev) => {
+        const validSelected = prev.selectedTimeframes.filter((tf) =>
+          Boolean(targetDatasets[tf] && targetDatasets[tf]!.candles.length > 0)
+        );
+        const singleExists = Boolean(
+          targetDatasets[prev.singleTimeframe] &&
+            targetDatasets[prev.singleTimeframe]!.candles.length > 0
+        );
+
+        let nextScope = prev.scope;
+        if (loadedIds.length < 2) {
+          nextScope = 'single_file';
+        } else if (loadedIds.length >= 2 && !bestMatchResult && prev.selectedTimeframes.length === 0) {
+          nextScope = 'multi_tf';
+        }
+
+        const nextSelected =
+          validSelected.length >= 2
+            ? validSelected
+            : loadedIds.length >= 2
+              ? loadedIds
+              : validSelected;
+
+        const nextSingle = singleExists ? prev.singleTimeframe : loadedIds[0] ?? prev.singleTimeframe;
+
+        const nextRefTs =
+          prev.referenceTimestamp !== null &&
+          targetDatasets[nextSingle]?.candles.some((c) => c.timestamp === prev.referenceTimestamp)
+            ? prev.referenceTimestamp
+            : null;
+
+        return {
+          ...prev,
+          scope: nextScope,
+          selectedTimeframes: nextSelected,
+          singleTimeframe: nextSingle,
+          referenceTimestamp: nextRefTs,
+        };
+      });
     },
-    [analysisResult, prefilledTargetNotice]
+    [analysisResult, bestMatchResult, prefilledTargetNotice]
   );
 
   const goToStep = useCallback(
@@ -254,6 +355,7 @@ export default function App() {
         startDateUtc: collectorConfig.startDateUtc,
         endDateUtc: collectorConfig.endDateUtc,
       });
+      setEngineMode('principal_target');
       setConfig(prefilled);
       setPrefilledTargetNotice(slot.displayLabel);
       setCurrentStep(3);
@@ -283,6 +385,23 @@ export default function App() {
     [datasets]
   );
 
+  const executeBestMatch = useCallback(async () => {
+    setIsRunningBestMatch(true);
+    setBestMatchProgress({ percent: 5, scanned: 0, total: 100, stage: 'indexing' });
+    try {
+      const res = await executeBestMatchSearchAsync(datasets, bestMatchConfig, (progress) => {
+        setBestMatchProgress(progress);
+      });
+      setBestMatchResult(res);
+      setBestMatchFilters(DEFAULT_BEST_MATCH_FILTERS);
+      setCurrentStep(4);
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+    } finally {
+      setIsRunningBestMatch(false);
+      setBestMatchProgress(null);
+    }
+  }, [datasets, bestMatchConfig]);
+
   const handleDateRangeChangeOnResults = useCallback(
     (startDateUtc: string, endDateUtc: string) => {
       const nextConfig: AnalysisConfig = {
@@ -304,14 +423,28 @@ export default function App() {
     } else if (currentStep === 2) {
       goToStep(3);
     } else if (currentStep === 3) {
-      executeAnalysis(config, true);
-    } else if (currentStep === 4 && analysisResult) {
-      const filtered = filterAndRankCandidates(analysisResult.candidates, filters);
-      exportCorrelationReportPdf(analysisResult, filtered, filters, datasets);
+      if (engineMode === 'best_matches') {
+        void executeBestMatch();
+      } else {
+        executeAnalysis(config, true);
+      }
+    } else if (currentStep === 4) {
+      if (engineMode === 'best_matches' && bestMatchResult) {
+        const filtered = filterAndRankBestMatches(bestMatchResult.matches, bestMatchFilters);
+        exportBestMatchesReportPdf(bestMatchResult, filtered, bestMatchFilters);
+      } else if (engineMode === 'principal_target' && analysisResult) {
+        const filtered = filterAndRankCandidates(analysisResult.candidates, filters);
+        exportCorrelationReportPdf(analysisResult, filtered, filters, datasets);
+      }
     } else if (currentStep === 'collector') {
       goToStep(3);
     }
   };
+
+  const step3BestMatchBlocked =
+    engineMode === 'best_matches' &&
+    bestMatchConfig.scope === 'multi_tf' &&
+    bestMatchConfig.selectedTimeframes.length < 2;
 
   const primaryActionMeta = useMemo(() => {
     switch (currentStep) {
@@ -323,11 +456,19 @@ export default function App() {
         };
       case 2:
         return {
-          label: 'Configure Target',
+          label: 'Configure Analysis',
           disabled: loadedTimeframes.length === 0,
           isExport: false,
         };
       case 3:
+        if (engineMode === 'best_matches') {
+          return {
+            label: isRunningBestMatch ? 'Searching...' : 'Search Matches',
+            disabled:
+              loadedTimeframes.length === 0 || isRunningBestMatch || step3BestMatchBlocked,
+            isExport: false,
+          };
+        }
         return {
           label: isRunningAnalysis ? 'Analyzing...' : 'Run Analysis',
           disabled: loadedTimeframes.length === 0 || isRunningAnalysis,
@@ -336,17 +477,26 @@ export default function App() {
       case 4:
         return {
           label: 'Export PDF',
-          disabled: !analysisResult,
+          disabled: !activeHasResults,
           isExport: true,
         };
       case 'collector':
         return {
-          label: 'Configure Target',
+          label: 'Configure Analysis',
           disabled: loadedTimeframes.length === 0,
           isExport: true,
         };
     }
-  }, [currentStep, loadedTimeframes.length, isParsingAny, isRunningAnalysis, analysisResult]);
+  }, [
+    currentStep,
+    loadedTimeframes.length,
+    isParsingAny,
+    engineMode,
+    isRunningBestMatch,
+    step3BestMatchBlocked,
+    isRunningAnalysis,
+    activeHasResults,
+  ]);
 
   return (
     <div className="min-h-screen bg-[#0B0F17] text-[#E2E8F0]">
@@ -354,7 +504,7 @@ export default function App() {
         currentStep={currentStep}
         maxUnlockedStep={maxUnlockedStep}
         loadedCount={loadedTimeframes.length}
-        hasResults={Boolean(analysisResult)}
+        hasResults={activeHasResults}
         onSelectStep={goToStep}
         onPrimaryAction={handleTopBarPrimaryAction}
         primaryActionLabel={primaryActionMeta.label}
@@ -390,6 +540,8 @@ export default function App() {
         {currentStep === 3 && (
           <StepConfigure
             datasets={datasets}
+            engineMode={engineMode}
+            onChangeEngineMode={setEngineMode}
             config={config}
             prefilledTargetNotice={prefilledTargetNotice}
             onDismissPrefilledNotice={() => setPrefilledTargetNotice(null)}
@@ -397,19 +549,28 @@ export default function App() {
               setConfig(next);
               setPrefilledTargetNotice(null);
             }}
-            onBack={() => goToStep(2)}
             onRunAnalysis={() => executeAnalysis(config, true)}
             isRunning={isRunningAnalysis}
+            bestMatchConfig={bestMatchConfig}
+            onChangeBestMatchConfig={setBestMatchConfig}
+            onRunBestMatch={() => void executeBestMatch()}
+            isRunningBestMatch={isRunningBestMatch}
+            bestMatchProgress={bestMatchProgress}
+            onBack={() => goToStep(2)}
           />
         )}
 
-        {currentStep === 4 && analysisResult && (
+        {currentStep === 4 && activeHasResults && (
           <StepResults
+            engineMode={engineMode}
             result={analysisResult}
             datasets={datasets}
             filters={filters}
             onChangeFilters={setFilters}
             onDateRangeChange={handleDateRangeChangeOnResults}
+            bestMatchResult={bestMatchResult}
+            bestMatchFilters={bestMatchFilters}
+            onChangeBestMatchFilters={setBestMatchFilters}
             onBackToConfigure={() => goToStep(3)}
           />
         )}

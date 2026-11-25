@@ -17,7 +17,7 @@ interface TopBarProps {
 const STEPS: { id: 1 | 2 | 3 | 4; shortLabel: string; label: string }[] = [
   { id: 1, shortLabel: '1. Upload', label: '1. Upload CSVs' },
   { id: 2, shortLabel: '2. Verify', label: '2. Calculate & Verify' },
-  { id: 3, shortLabel: '3. Configure', label: '3. Configure Target' },
+  { id: 3, shortLabel: '3. Configure', label: '3. Configure Analysis' },
   { id: 4, shortLabel: '4. Results', label: '4. Results Dashboard' },
 ];
 

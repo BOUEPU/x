@@ -1,6 +1,8 @@
 import { formatDecimal, serializeEnrichedCandlesToCsv } from './csvParser';
 import {
   AnalysisResult,
+  BestMatchItem,
+  BestMatchResult,
   CollectedCandleSlot,
   CollectorResult,
   PrincipalCandidateResult,
@@ -186,4 +188,67 @@ export function downloadSingleSlotHistoryCsv(slot: CollectedCandleSlot): void {
     'text/csv;charset=utf-8;'
   );
 }
+
+/**
+ * Exports ranked Best Matched Candles results (Mode A Multi-TF or Mode B Single-File) as CSV.
+ */
+export function downloadBestMatchesCsv(
+  result: BestMatchResult,
+  filteredMatches: BestMatchItem[]
+): void {
+  const headers = [
+    'Rank',
+    'Anchor_Timeframe',
+    'Start_Time_UTC',
+    'End_Time_UTC',
+    'Match_Score_Pct',
+    'Directional_Score_Pct',
+    'Structural_Score_Pct',
+    'Volume_Score_Pct',
+    'Dominant_Direction',
+    'Pattern_Label',
+    'Summary_Detail',
+    'Candle_Breakdown',
+  ];
+
+  const rows: string[] = [headers.join(',')];
+
+  filteredMatches.forEach((m, idx) => {
+    const breakdown = m.snapshots
+      .map(
+        (s) =>
+          `${s.roleLabel}[${s.candle.timeStr} O=${s.candle.open} H=${s.candle.high} L=${s.candle.low} C=${s.candle.close} Body=${(s.features.bodyRatio * 100).toFixed(0)}%]`
+      )
+      .join(' | ');
+
+    rows.push(
+      [
+        idx + 1,
+        m.anchorTimeframe,
+        m.timeStr,
+        m.endTimeStr,
+        m.matchScore.toFixed(2),
+        m.directionalScore.toFixed(2),
+        m.structuralScore.toFixed(2),
+        m.volumeScore !== null ? m.volumeScore.toFixed(2) : 'N/A',
+        m.dominantDirection,
+        escapeCsvCell(m.patternLabel),
+        escapeCsvCell(m.summaryDetail),
+        escapeCsvCell(breakdown),
+      ].join(',')
+    );
+  });
+
+  const scopeSlug =
+    result.scope === 'multi_tf'
+      ? `multi_${result.activeTimeframes.join('_').toLowerCase()}`
+      : `single_${result.config.singleTimeframe.toLowerCase()}`;
+
+  triggerDownload(
+    rows.join('\n'),
+    `btc_best_matches_${scopeSlug}.csv`,
+    'text/csv;charset=utf-8;'
+  );
+}
+
 

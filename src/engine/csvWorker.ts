@@ -1,16 +1,34 @@
 import { classifyAndAuditCandles } from './audit';
+import { runBestMatchedCandlesFromCandles } from './correlation';
 import {
   parseCsvDataLine,
   sortAndDeduplicateCandles,
   validateCsvHeader,
 } from './csvParser';
-import { MalformedRow, RawCandle, TimeframeDataset, TimeframeId } from './types';
+import {
+  BestMatchConfig,
+  BestMatchProgress,
+  BestMatchResult,
+  EnrichedCandle,
+  MalformedRow,
+  RawCandle,
+  TimeframeDataset,
+  TimeframeId,
+} from './types';
 
 export interface WorkerParseRequest {
   type: 'parse';
   timeframe: TimeframeId;
   file: File;
 }
+
+export interface WorkerBestMatchRequest {
+  type: 'best_match';
+  candlesByTf: Partial<Record<TimeframeId, EnrichedCandle[]>>;
+  config: BestMatchConfig;
+}
+
+export type WorkerRequest = WorkerParseRequest | WorkerBestMatchRequest;
 
 export type WorkerParseResponse =
   | {
@@ -30,13 +48,53 @@ export type WorkerParseResponse =
       timeframe: TimeframeId;
       fileName: string;
       errorMessage: string;
+    }
+  | {
+      type: 'best_match_progress';
+      progress: BestMatchProgress;
+    }
+  | {
+      type: 'best_match_complete';
+      result: BestMatchResult;
+    }
+  | {
+      type: 'best_match_error';
+      errorMessage: string;
     };
 
 const CHUNK_SIZE_BYTES = 2 * 1024 * 1024; // 2 MB chunks for smooth streaming of multi-year 1MIN CSVs
 const MAX_LOGGED_MALFORMED = 200;
 
-self.onmessage = async (event: MessageEvent<WorkerParseRequest>) => {
+self.onmessage = async (event: MessageEvent<WorkerRequest>) => {
   const msg = event.data;
+  if (msg.type === 'best_match') {
+    try {
+      let lastPost = 0;
+      const result = runBestMatchedCandlesFromCandles(
+        msg.candlesByTf,
+        msg.config,
+        (progress) => {
+          const now = Date.now();
+          if (now - lastPost >= 60 || progress.percent >= 100) {
+            lastPost = now;
+            const pMsg: WorkerParseResponse = { type: 'best_match_progress', progress };
+            self.postMessage(pMsg);
+          }
+        },
+        true
+      );
+      const doneMsg: WorkerParseResponse = { type: 'best_match_complete', result };
+      self.postMessage(doneMsg);
+    } catch (err) {
+      const errMsg: WorkerParseResponse = {
+        type: 'best_match_error',
+        errorMessage: err instanceof Error ? err.message : 'Best Match worker failed.',
+      };
+      self.postMessage(errMsg);
+    }
+    return;
+  }
+
   if (msg.type !== 'parse') return;
 
   const { timeframe, file } = msg;

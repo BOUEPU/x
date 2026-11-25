@@ -14,8 +14,21 @@ import {
   filterCollectedSlots,
   getIsoWeekNumberUtc,
 } from './collector';
-import { filterAndRankCandidates, runCorrelationAnalysis } from './correlation';
-import { AnalysisConfig, EnrichedCandle, TimeframeDataset, TimeframeId } from './types';
+import {
+  computeDatasetFeatures,
+  filterAndRankBestMatches,
+  filterAndRankCandidates,
+  getLoadedTimeframeIds,
+  runBestMatchedCandlesSearch,
+  runCorrelationAnalysis,
+} from './correlation';
+import {
+  AnalysisConfig,
+  BestMatchConfig,
+  EnrichedCandle,
+  TimeframeDataset,
+  TimeframeId,
+} from './types';
 
 function buildDataset(tf: TimeframeId, csvText: string): TimeframeDataset {
   const core = parseCsvText(csvText);
@@ -440,4 +453,176 @@ test('candle data collector supports ALL-timeframe collection, DOW/ISO-Week/Mont
   assert.equal(targetCfg.targetTimeframe, '1D');
   assert.equal(targetCfg.targetSlotKey, 'DOW_0');
 });
+
+test('Mode A Multi-Timeframe Best Match search aligns 2 and 3 timeframes under lowest_tf and parent_window anchors', () => {
+  // Build 4H, 1H, 15MIN where 00:00 window has strong aligned bullish candles, while 04:00 conflicts
+  const csv4H = [
+    'Time (UTC),Open,High,Low,Close,Volume ',
+    '2021.01.01 00:00:00,100,122,99,120,10', // strong bullish
+    '2021.01.01 04:00:00,120,122,100,102,10', // strong bearish
+  ].join('\n');
+
+  const csv1H = [
+    'Time (UTC),Open,High,Low,Close,Volume ',
+    '2021.01.01 00:00:00,100,111,99,110,4',   // strong bullish
+    '2021.01.01 03:00:00,110,121,109,120,5',  // strong bullish closing 4H window
+    '2021.01.01 04:00:00,120,125,119,124,4',  // bullish (conflicts with 4H bearish!)
+    '2021.01.01 07:00:00,102,112,101,111,4',  // bullish closing 4H window (conflicts with 4H bearish!)
+  ].join('\n');
+
+  const csv15M = [
+    'Time (UTC),Open,High,Low,Close,Volume ',
+    '2021.01.01 03:45:00,115,121,114,120,2', // strong bullish inside 03:00 1H & 00:00 4H
+    '2021.01.01 07:45:00,109,112,108,111,2', // bullish inside 07:00 1H & 04:00 4H
+  ].join('\n');
+
+  const ds4H = buildDataset('4H', csv4H);
+  const ds1H = buildDataset('1H', csv1H);
+  const ds15M = buildDataset('15MIN', csv15M);
+
+  const loaded = getLoadedTimeframeIds({ '4H': ds4H, '1H': ds1H, '15MIN': ds15M });
+  assert.deepEqual(loaded, ['15MIN', '1H', '4H']);
+
+  // Lowest TF anchor across 3 timeframes
+  const cfgLowest: BestMatchConfig = {
+    scope: 'multi_tf',
+    selectedTimeframes: ['15MIN', '1H', '4H'],
+    multiTfAnchor: 'lowest_tf',
+    singleTimeframe: '1H',
+    singleSubMode: 'reference',
+    sequenceLength: 1,
+    referenceTimestamp: null,
+    includeVolumeWeight: false,
+    minMatchScore: 50,
+    maxResults: 10,
+    startDateUtc: '',
+    endDateUtc: '',
+  };
+  const resLowest = runBestMatchedCandlesSearch(
+    { '15MIN': ds15M, '1H': ds1H, '4H': ds4H },
+    cfgLowest
+  );
+  assert.equal(resLowest.totalCandidatesScanned, 2);
+  assert.ok(resLowest.matches.length >= 1);
+  // 03:45 aligns with 03:00 1H & 00:00 4H (all 3 strong bullish) -> Rank #1 > 90%
+  assert.equal(resLowest.matches[0].anchorTimeframe, '15MIN');
+  assert.equal(resLowest.matches[0].timeStr, '2021.01.01 03:45:00');
+  assert.equal(resLowest.matches[0].directionalScore, 100);
+  assert.ok(resLowest.matches[0].matchScore > 90);
+  assert.equal(resLowest.matches[0].snapshots.length, 3);
+
+  // Parent window anchor across 2 timeframes (1H + 4H)
+  const cfgParent: BestMatchConfig = {
+    ...cfgLowest,
+    selectedTimeframes: ['1H', '4H'],
+    multiTfAnchor: 'parent_window',
+    minMatchScore: 0,
+  };
+  const resParent = runBestMatchedCandlesSearch({ '1H': ds1H, '4H': ds4H }, cfgParent);
+  assert.equal(resParent.totalCandidatesScanned, 2);
+  assert.equal(resParent.matches.length, 2);
+  assert.equal(resParent.matches[0].anchorTimeframe, '4H');
+  assert.equal(resParent.matches[0].timeStr, '2021.01.01 00:00:00');
+  assert.equal(resParent.matches[0].snapshots[0].candle.timeStr, '2021.01.01 03:00:00');
+  assert.ok(resParent.matches[0].matchScore > resParent.matches[1].matchScore);
+
+  // Non-overlapping datasets handled cleanly
+  const dsFar1D = buildDataset(
+    '1D',
+    ['Time (UTC),Open,High,Low,Close,Volume ', '2024.01.01 00:00:00,40000,41000,39000,40500,10'].join('\n')
+  );
+  const nonOverlapRes = runBestMatchedCandlesSearch(
+    { '1H': ds1H, '1D': dsFar1D },
+    { ...cfgParent, selectedTimeframes: ['1H', '1D'] }
+  );
+  assert.equal(nonOverlapRes.matches.length, 0);
+  assert.ok(nonOverlapRes.warningMessage?.includes('Non-overlapping'));
+});
+
+test('Mode B Single-File Pattern Search works with 1 CSV across K=1,2,3 reference sequences, volume toggle, and auto-scan', () => {
+  // Construct 1H single-file dataset with repeated identical 2-bar bullish setup + high volume contrast + flat zero-range Doji
+  const csv1H = [
+    'Time (UTC),Open,High,Low,Close,Volume ',
+    // Setup #1 at 00:00-01:00 (high volume matching target)
+    '2021.01.01 00:00:00,100,110,99,109,50',
+    '2021.01.01 01:00:00,109,120,108,119,60',
+    // Zero-range flat Doji (division-by-zero test!)
+    '2021.01.01 02:00:00,119,119,119,119,0',
+    // Bearish pin rejection bar
+    '2021.01.01 03:00:00,119,135,115,117,12',
+    // Setup #2 at 04:00-05:00 (same geometry as Setup #1, very low volume)
+    '2021.01.01 04:00:00,117,127,116,126,1',
+    '2021.01.01 05:00:00,126,137,125,136,1',
+    // Latest reference sequence at 06:00-07:00 (strong bullish pair + elevated volume)
+    '2021.01.01 06:00:00,136,146,135,145,55',
+    '2021.01.01 07:00:00,145,156,144,155,65',
+  ].join('\n');
+
+  const ds1H = buildDataset('1H', csv1H);
+
+  // Verify zero-range Doji produces finite zeroed features without NaN
+  const feats = computeDatasetFeatures(ds1H.candles);
+  assert.equal(feats[2].range, 0);
+  assert.equal(feats[2].bodyRatio, 0);
+  assert.equal(feats[2].upperWickRatio, 0);
+  assert.equal(feats[2].lowerWickRatio, 0);
+  assert.ok(!Number.isNaN(feats[2].rangeAtrRatio));
+  assert.ok(!Number.isNaN(feats[2].volumeRatio));
+
+  // K=2 Reference Search using Latest Sequence in File (referenceTimestamp: null) WITHOUT volume weight
+  const baseCfg: BestMatchConfig = {
+    scope: 'single_file',
+    selectedTimeframes: ['1H'],
+    multiTfAnchor: 'lowest_tf',
+    singleTimeframe: '1H',
+    singleSubMode: 'reference',
+    sequenceLength: 2,
+    referenceTimestamp: null,
+    includeVolumeWeight: false,
+    minMatchScore: 50,
+    maxResults: 10,
+    startDateUtc: '',
+    endDateUtc: '',
+  };
+
+  const refNoVol = runBestMatchedCandlesSearch({ '1H': ds1H }, baseCfg);
+  assert.equal(refNoVol.referenceSnapshots?.length, 2);
+  assert.equal(refNoVol.referenceSnapshots?.[0].candle.timeStr, '2021.01.01 06:00:00');
+  // Must exclude reference candles themselves (06:00 and overlapping 05:00)
+  assert.ok(refNoVol.matches.every((m) => m.timeStr !== '2021.01.01 06:00:00'));
+  assert.ok(refNoVol.matches.every((m) => m.volumeScore === null));
+
+  // Turn ON volume weight toggle -> Setup #1 (high volume 50/60) must outrank Setup #2 (tiny volume 1/1)
+  const refWithVol = runBestMatchedCandlesSearch(
+    { '1H': ds1H },
+    { ...baseCfg, includeVolumeWeight: true, minMatchScore: 0 }
+  );
+  assert.equal(refWithVol.matches[0].timeStr, '2021.01.01 00:00:00');
+  assert.ok(refWithVol.matches[0].volumeScore !== null);
+
+  // K=3 Reference Search works cleanly without error
+  const refK3 = runBestMatchedCandlesSearch(
+    { '1H': ds1H },
+    { ...baseCfg, sequenceLength: 3, minMatchScore: 0 }
+  );
+  assert.equal(refK3.referenceSnapshots?.length, 3);
+  assert.ok(refK3.matches.length >= 1);
+  assert.equal(refK3.matches[0].snapshots.length, 3);
+
+  // Auto-Scan K=1 & K=2 finds cleanest momentum/pin setups and filterAndRankBestMatches narrows by direction
+  const autoK1 = runBestMatchedCandlesSearch(
+    { '1H': ds1H },
+    { ...baseCfg, singleSubMode: 'auto_scan', sequenceLength: 1, minMatchScore: 50 }
+  );
+  assert.ok(autoK1.matches.length >= 2);
+  assert.ok(autoK1.matches.every((m) => !Number.isNaN(m.matchScore)));
+
+  const bullOnly = filterAndRankBestMatches(autoK1.matches, {
+    searchQuery: '',
+    directionFilter: 'bullish',
+    minScoreOverride: 50,
+  });
+  assert.ok(bullOnly.every((m) => m.dominantDirection === 'BULLISH'));
+});
+
 
