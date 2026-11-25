@@ -1,0 +1,6 @@
+{
+  "name": "BTC Multi-Timeframe Candle Correlation Analyzer",
+  "description": "Client-side institutional analytics workbench for auditing BTC multi-timeframe OHLCV CSV datasets and discovering high-alignment Principal Candles.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}
