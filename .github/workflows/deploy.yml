@@ -30,6 +30,8 @@ jobs:
         run: bun install
 
       - name: Build static site
+        env:
+          VITE_BASE_PATH: /x/
         run: bun run build
 
       - name: Upload Pages artifact

@@ -9,7 +9,9 @@ const rootDir = path.dirname(fileURLToPath(import.meta.url));
 
 export default defineConfig(() => {
   return {
-    base: process.env.VITE_BASE_PATH || './',
+    base:
+      process.env.VITE_BASE_PATH ||
+      (process.env.GITHUB_ACTIONS === 'true' ? '/x/' : './'),
     worker: {
       format: 'es' as const,
     },
